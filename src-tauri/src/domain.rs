@@ -36,8 +36,8 @@ impl TaskStatus {
             WorkspaceCreating => &[Implementing, Failed],
             Implementing => &[Testing, Failed],
             Testing => &[Repairing, Validating, Failed],
-            Repairing => &[Testing, Failed],
-            Validating => &[Committing, Failed],
+            Repairing => &[Testing, Validating, Failed],
+            Validating => &[Committing, Repairing, Failed],
             Committing => &[PrCreating, Failed],
             PrCreating => &[PrCreated, Failed],
             PrCreated => &[WaitingForReview, Failed],
@@ -103,6 +103,16 @@ pub struct AgentTask {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct Plan {
+    pub id: String,
+    pub task_id: String,
+    pub current_version: u32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlanStep {
     pub order: u32,
     pub description: String,
@@ -143,6 +153,17 @@ pub struct PlanApproval {
     pub approved_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanMessage {
+    pub id: String,
+    pub task_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+    pub plan_version: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AgentRunStatus {
@@ -159,10 +180,29 @@ pub struct AgentRun {
     pub id: String,
     pub task_id: String,
     pub mode: String,
+    pub agent: Option<String>,
     pub status: AgentRunStatus,
     pub session_id: Option<String>,
     pub started_at: String,
     pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRunView {
+    pub run: AgentRun,
+    pub events: Vec<AgentEvent>,
+    pub output: String,
+    pub cost: f64,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoItem {
+    pub content: String,
+    pub status: String,
+    pub priority: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +217,32 @@ pub enum AgentEvent {
         #[serde(rename = "runId")]
         run_id: String,
         content: String,
+        timestamp: String,
+    },
+    Reasoning {
+        #[serde(rename = "runId")]
+        run_id: String,
+        content: String,
+        timestamp: String,
+    },
+    Tool {
+        #[serde(rename = "runId")]
+        run_id: String,
+        name: String,
+        title: String,
+        status: String,
+        timestamp: String,
+    },
+    Todo {
+        #[serde(rename = "runId")]
+        run_id: String,
+        todos: Vec<TodoItem>,
+        timestamp: String,
+    },
+    PermissionRequest {
+        #[serde(rename = "runId")]
+        run_id: String,
+        title: String,
         timestamp: String,
     },
     FileRead {
@@ -203,6 +269,7 @@ pub enum AgentEvent {
         command: String,
         #[serde(rename = "exitCode")]
         exit_code: i32,
+        output: Option<String>,
         timestamp: String,
     },
     TestResult {
@@ -224,6 +291,38 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    pub fn run_id(&self) -> &str {
+        match self {
+            AgentEvent::Started { run_id, .. }
+            | AgentEvent::Message { run_id, .. }
+            | AgentEvent::Reasoning { run_id, .. }
+            | AgentEvent::Tool { run_id, .. }
+            | AgentEvent::Todo { run_id, .. }
+            | AgentEvent::PermissionRequest { run_id, .. }
+            | AgentEvent::FileRead { run_id, .. }
+            | AgentEvent::FileChanged { run_id, .. }
+            | AgentEvent::CommandStarted { run_id, .. }
+            | AgentEvent::CommandFinished { run_id, .. }
+            | AgentEvent::TestResult { run_id, .. }
+            | AgentEvent::Finished { run_id, .. }
+            | AgentEvent::Failed { run_id, .. } => run_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub free: bool,
+    pub cost_input: f64,
+    pub cost_output: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
@@ -233,6 +332,18 @@ pub struct Workspace {
     pub path: String,
     pub branch_name: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceStatus {
+    pub task_id: String,
+    pub path: String,
+    pub branch_name: String,
+    pub exists: bool,
+    pub is_clean: bool,
+    pub changed_files: u32,
+    pub current_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +375,60 @@ pub struct ValidationResult {
     pub passed: bool,
     pub exit_code: i32,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationRun {
+    pub id: String,
+    pub task_id: String,
+    pub passed: bool,
+    pub results: Vec<ValidationResult>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub path: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffStats {
+    pub files_changed: u32,
+    pub additions: u32,
+    pub deletions: u32,
+    pub files: Vec<FileStat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDiff {
+    pub path: String,
+    pub status: String,
+    pub additions: u32,
+    pub deletions: u32,
+    pub original: String,
+    pub modified: String,
+    pub binary: bool,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestRun {
+    pub id: String,
+    pub task_id: String,
+    pub attempt: u32,
+    pub command: String,
+    pub passed: bool,
+    pub exit_code: i32,
+    pub output: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

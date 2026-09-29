@@ -28,8 +28,8 @@ export const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   WORKSPACE_CREATING: ["IMPLEMENTING", "FAILED"],
   IMPLEMENTING: ["TESTING", "FAILED"],
   TESTING: ["REPAIRING", "VALIDATING", "FAILED"],
-  REPAIRING: ["TESTING", "FAILED"],
-  VALIDATING: ["COMMITTING", "FAILED"],
+  REPAIRING: ["TESTING", "VALIDATING", "FAILED"],
+  VALIDATING: ["COMMITTING", "REPAIRING", "FAILED"],
   COMMITTING: ["PR_CREATING", "FAILED"],
   PR_CREATING: ["PR_CREATED", "FAILED"],
   PR_CREATED: ["WAITING_FOR_REVIEW", "FAILED"],
@@ -133,6 +133,15 @@ export interface PlanApproval {
   approvedAt: string;
 }
 
+export interface PlanMessage {
+  id: string;
+  taskId: string;
+  role: "user" | "agent";
+  content: string;
+  createdAt: string;
+  planVersion?: number | null;
+}
+
 export type AgentRunStatus =
   | "PENDING"
   | "RUNNING"
@@ -143,16 +152,57 @@ export type AgentRunStatus =
 export interface AgentRun {
   id: string;
   taskId: string;
-  mode: "planning" | "implementation" | "repair";
+  mode: string;
+  agent?: string | null;
   status: AgentRunStatus;
   sessionId?: string;
   startedAt: string;
   completedAt?: string;
 }
 
+export interface AgentRunView {
+  run: AgentRun;
+  events: AgentEvent[];
+  output: string;
+  cost: number;
+  model?: string | null;
+}
+
+export interface TodoItem {
+  content: string;
+  status: string;
+  priority: string;
+}
+
+export interface ModelInfo {
+  id: string;
+  name: string;
+  providerId: string;
+  modelId: string;
+  free: boolean;
+  costInput: number;
+  costOutput: number;
+}
+
 export type AgentEvent =
   | { type: "started"; runId: string; timestamp: string }
   | { type: "message"; runId: string; content: string; timestamp: string }
+  | { type: "reasoning"; runId: string; content: string; timestamp: string }
+  | {
+      type: "tool";
+      runId: string;
+      name: string;
+      title: string;
+      status: string;
+      timestamp: string;
+    }
+  | { type: "todo"; runId: string; todos: TodoItem[]; timestamp: string }
+  | {
+      type: "permission_request";
+      runId: string;
+      title: string;
+      timestamp: string;
+    }
   | { type: "file_read"; runId: string; path: string; timestamp: string }
   | { type: "file_changed"; runId: string; path: string; timestamp: string }
   | { type: "command_started"; runId: string; command: string; timestamp: string }
@@ -161,6 +211,7 @@ export type AgentEvent =
       runId: string;
       command: string;
       exitCode: number;
+      output: string | null;
       timestamp: string;
     }
   | { type: "test_result"; runId: string; passed: boolean; timestamp: string }
@@ -174,6 +225,16 @@ export interface Workspace {
   path: string;
   branchName: string;
   createdAt: string;
+}
+
+export interface WorkspaceStatus {
+  taskId: string;
+  path: string;
+  branchName: string;
+  exists: boolean;
+  isClean: boolean;
+  changedFiles: number;
+  currentBranch: string | null;
 }
 
 export interface PullRequest {
@@ -199,6 +260,50 @@ export interface ValidationResult {
   passed: boolean;
   exitCode: number;
   output: string;
+}
+
+export interface ValidationRun {
+  id: string;
+  taskId: string;
+  passed: boolean;
+  results: ValidationResult[];
+  createdAt: string;
+}
+
+export interface FileStat {
+  path: string;
+  additions: number;
+  deletions: number;
+  status: string;
+}
+
+export interface DiffStats {
+  filesChanged: number;
+  additions: number;
+  deletions: number;
+  files: FileStat[];
+}
+
+export interface FileDiff {
+  path: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  original: string;
+  modified: string;
+  binary: boolean;
+  truncated: boolean;
+}
+
+export interface TestRun {
+  id: string;
+  taskId: string;
+  attempt: number;
+  command: string;
+  passed: boolean;
+  exitCode: number;
+  output: string;
+  createdAt: string;
 }
 
 export interface AppInfo {

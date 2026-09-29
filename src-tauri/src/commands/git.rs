@@ -1,17 +1,9 @@
+use tauri::State;
+
 use crate::commands::repository::not_implemented;
-use crate::domain::ValidationResult;
-
-#[tauri::command]
-pub fn get_changed_files(workspace_path: String) -> Result<Vec<String>, String> {
-    let _ = workspace_path;
-    Err(not_implemented("get_changed_files (Phase 2)"))
-}
-
-#[tauri::command]
-pub fn get_diff(workspace_path: String) -> Result<String, String> {
-    let _ = workspace_path;
-    Err(not_implemented("get_diff (Phase 2)"))
-}
+use crate::db;
+use crate::domain::{DiffStats, FileDiff};
+use crate::state::AppState;
 
 #[tauri::command]
 pub fn commit_changes(workspace_path: String, message: String) -> Result<String, String> {
@@ -26,10 +18,45 @@ pub fn push_branch(workspace_path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn run_validation(
-    workspace_path: String,
-    command: String,
-) -> Result<ValidationResult, String> {
-    let _ = (workspace_path, command);
-    Err(not_implemented("run_validation (Phase 13)"))
+pub fn get_workspace_stats(state: State<AppState>, task_id: String) -> Result<DiffStats, String> {
+    let workspace_path = {
+        let connection = state.db.lock().map_err(|error| error.to_string())?;
+        let task = db::get_task(&connection, &task_id)?
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        task.workspace_path
+            .ok_or_else(|| "task has no workspace yet".to_string())?
+    };
+
+    let path = std::path::Path::new(&workspace_path);
+    if !path.is_dir() {
+        return Err(format!("workspace path does not exist: {workspace_path}"));
+    }
+
+    crate::git::worktree_stats(path)
+}
+
+#[tauri::command]
+pub fn get_workspace_diffs(
+    state: State<AppState>,
+    task_id: String,
+) -> Result<Vec<FileDiff>, String> {
+    let workspace_path = {
+        let connection = state.db.lock().map_err(|error| error.to_string())?;
+        let task = db::get_task(&connection, &task_id)?
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        task.workspace_path
+            .ok_or_else(|| "task has no workspace yet".to_string())?
+    };
+
+    let path = std::path::Path::new(&workspace_path);
+    if !path.is_dir() {
+        return Err(format!("workspace path does not exist: {workspace_path}"));
+    }
+
+    let stats = crate::git::worktree_stats(path)?;
+    Ok(stats
+        .files
+        .iter()
+        .map(|file| crate::git::file_diff(path, &file.path))
+        .collect())
 }

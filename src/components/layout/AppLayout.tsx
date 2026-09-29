@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from "react-router-dom";
 import {
+  Bot,
   ClipboardList,
   FolderGit2,
   LayoutDashboard,
@@ -11,6 +12,7 @@ const navItems = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, end: true },
   { to: "/repositories", label: "Repositories", icon: FolderGit2, end: false },
   { to: "/tasks", label: "Task", icon: ClipboardList, end: false },
+  { to: "/agent", label: "Agent", icon: Bot, end: false },
   { to: "/settings", label: "Settings", icon: Settings, end: false },
 ];
 
@@ -44,7 +46,7 @@ export function AppLayout() {
           ))}
         </nav>
         <div className="border-t p-3 text-xs text-muted-foreground">
-          Phase 1 &middot; shell
+          Local MVP
         </div>
       </aside>
       <main className="flex-1 overflow-auto">
