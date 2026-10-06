@@ -12,6 +12,7 @@ import {
   ListChecks,
   Loader2,
   Play,
+  RotateCcw,
   Send,
   User,
   XCircle,
@@ -35,7 +36,11 @@ function statusVariant(
   if (status === "FAILED" || status === "REJECTED") {
     return "destructive";
   }
-  if (status === "APPROVED" || status === "PLAN_READY") {
+  if (
+    status === "APPROVED" ||
+    status === "PLAN_READY" ||
+    status === "INTERRUPTED"
+  ) {
     return "outline";
   }
   return "secondary";
@@ -62,6 +67,7 @@ export function PlanReview() {
   const rejectPlan = useAppStore((state) => state.rejectPlan);
   const revisePlan = useAppStore((state) => state.revisePlan);
   const startImplementation = useAppStore((state) => state.startImplementation);
+  const resumeTask = useAppStore((state) => state.resumeTask);
 
   const [busy, setBusy] = useState(false);
   const [revising, setRevising] = useState(false);
@@ -188,6 +194,20 @@ export function PlanReview() {
     setBusy(true);
     try {
       await startImplementation(task.id);
+    } catch {
+      // Surfaced through the store.
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleResume() {
+    if (!task) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await resumeTask(task.id);
     } catch {
       // Surfaced through the store.
     } finally {
@@ -500,6 +520,22 @@ export function PlanReview() {
                 <Link to={`/tasks/${task.id}/run`} className="text-primary">
                   Open execution
                 </Link>
+              </div>
+            ) : task.status === "INTERRUPTED" ? (
+              <div className="flex flex-wrap items-center gap-3">
+                <p className="flex items-center gap-2 text-sm text-amber-600">
+                  <AlertTriangle className="size-4" />
+                  Interrupted during {task.interruptedFrom ?? "a previous run"} by an
+                  app restart.
+                </p>
+                <Button onClick={handleResume} disabled={busy}>
+                  {busy ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <RotateCcw className="size-4" />
+                  )}
+                  Resume
+                </Button>
               </div>
             ) : task.status === "REJECTED" ? (
               <p className="flex items-center gap-2 text-sm text-muted-foreground">

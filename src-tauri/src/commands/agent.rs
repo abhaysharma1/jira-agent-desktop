@@ -173,6 +173,7 @@ pub fn stop_agent(
                     runtime.cost,
                     runtime.model.as_deref(),
                 );
+                let _ = db::delete_opencode_server(&connection, &runtime.run.id);
             }
             let _ = app.emit(
                 "agent://status",

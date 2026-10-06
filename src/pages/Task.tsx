@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
+  AlertTriangle,
+  CheckCircle2,
   ClipboardList,
   GitBranch,
   Plus,
   RefreshCw,
   Sparkles,
   Trash2,
+  XCircle,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -19,22 +22,57 @@ import {
 } from "@/components/ui/card";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { useAppStore } from "@/stores/appStore";
-import type { TaskStatus } from "@/types";
+import { api } from "@/api/tauri";
+import type { AgentTask, TaskStatus } from "@/types";
 
 const DEFAULT_MODEL = "opencode/nemotron-3-ultra-free";
+
+/** Terminal buckets shown on the History tab. */
+const HISTORY_GROUPS: {
+  label: string;
+  icon: typeof ClipboardList;
+  statuses: TaskStatus[];
+}[] = [
+  {
+    label: "Completed",
+    icon: CheckCircle2,
+    statuses: ["PR_CREATED", "WAITING_FOR_REVIEW"],
+  },
+  { label: "Failed", icon: AlertTriangle, statuses: ["FAILED"] },
+  { label: "Closed", icon: XCircle, statuses: ["SKIPPED", "REJECTED"] },
+];
+
+const HISTORY_STATUSES = new Set<TaskStatus>(
+  HISTORY_GROUPS.flatMap((group) => group.statuses),
+);
 
 function TaskStatusBadge({ status }: { status: TaskStatus }) {
   const variant =
     status === "FAILED"
       ? "destructive"
-      : status === "PLAN_READY" || status === "APPROVED"
+      : status === "PLAN_READY" ||
+          status === "APPROVED" ||
+          status === "INTERRUPTED"
         ? "outline"
         : "secondary";
-  return <Badge variant={variant}>{status}</Badge>;
+  return (
+    <Badge
+      variant={variant}
+      className={
+        status === "INTERRUPTED"
+          ? "border-amber-500 text-amber-600"
+          : undefined
+      }
+    >
+      {status}
+    </Badge>
+  );
 }
 
 export function Task() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const ticketParam = searchParams.get("ticket");
   const repositories = useAppStore((state) => state.repositories);
   const models = useAppStore((state) => state.models);
   const tasks = useAppStore((state) => state.tasks);
@@ -64,6 +102,9 @@ export function Task() {
   const [acceptance, setAcceptance] = useState("");
   const [model, setModel] = useState(DEFAULT_MODEL);
   const [planning, setPlanning] = useState(false);
+  const [taskTab, setTaskTab] = useState<"active" | "history">(
+    searchParams.get("tab") === "history" ? "history" : "active",
+  );
 
   const [wsRepositoryId, setWsRepositoryId] = useState("");
   const [wsTaskId, setWsTaskId] = useState("CC-142");
@@ -97,6 +138,22 @@ export function Task() {
       }
     }
   }, [workspaces, workspaceStatuses, refreshWorkspaceStatus]);
+
+  useEffect(() => {
+    if (!ticketParam) {
+      return;
+    }
+    setKey(ticketParam);
+    void api
+      .getJiraIssue(ticketParam)
+      .then((issue) => {
+        setTitle(issue.summary);
+        setDescription(issue.description);
+      })
+      .catch(() => {
+        // The ticket could not be loaded; the user can still fill it in.
+      });
+  }, [ticketParam]);
 
   const activePlan = activeTask ? planVersions[activeTask.id] : undefined;
 
@@ -137,6 +194,29 @@ export function Task() {
     } finally {
       setWsBusy(false);
     }
+  }
+
+  const activeTasks = tasks.filter((task) => !HISTORY_STATUSES.has(task.status));
+  const historyTasks = tasks.filter((task) => HISTORY_STATUSES.has(task.status));
+
+  function renderTaskRow(task: AgentTask) {
+    return (
+      <button
+        key={task.id}
+        type="button"
+        onClick={() => {
+          setActiveTask(task);
+          navigate(`/tasks/${task.id}`);
+        }}
+        className={`flex items-center gap-2 rounded-lg border p-2 text-left text-sm ${
+          task.id === activeTask?.id ? "border-ring bg-muted" : "border-input"
+        }`}
+      >
+        <TaskStatusBadge status={task.status} />
+        <span className="font-mono text-xs">{task.jiraIssueKey}</span>
+        <span className="truncate">{task.title}</span>
+      </button>
+    );
   }
 
   return (
@@ -250,33 +330,58 @@ export function Task() {
           <Card>
             <CardHeader>
               <CardDescription>Tasks</CardDescription>
-              <CardTitle>{tasks.length} total</CardTitle>
+              <CardTitle className="flex items-center justify-between gap-2">
+                <span>{tasks.length} total</span>
+                <span className="flex gap-1">
+                  <Button
+                    variant={taskTab === "active" ? "secondary" : "ghost"}
+                    size="sm"
+                    onClick={() => setTaskTab("active")}
+                  >
+                    Active
+                  </Button>
+                  <Button
+                    variant={taskTab === "history" ? "secondary" : "ghost"}
+                    size="sm"
+                    onClick={() => setTaskTab("history")}
+                  >
+                    History
+                  </Button>
+                </span>
+              </CardTitle>
             </CardHeader>
             <CardContent className="flex flex-col gap-2">
-              {tasks.length === 0 ? (
-                <p className="text-sm text-muted-foreground">No tasks yet.</p>
+              {taskTab === "active" ? (
+                activeTasks.length === 0 ? (
+                  <p className="text-sm text-muted-foreground">
+                    No active tasks.
+                  </p>
+                ) : (
+                  activeTasks.map(renderTaskRow)
+                )
+              ) : historyTasks.length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  Nothing finished yet.
+                </p>
               ) : (
-                tasks.map((task) => (
-                  <button
-                    key={task.id}
-                    type="button"
-                    onClick={() => {
-                      setActiveTask(task);
-                      navigate(`/tasks/${task.id}`);
-                    }}
-                    className={`flex items-center gap-2 rounded-lg border p-2 text-left text-sm ${
-                      task.id === activeTask?.id
-                        ? "border-ring bg-muted"
-                        : "border-input"
-                    }`}
-                  >
-                    <TaskStatusBadge status={task.status} />
-                    <span className="font-mono text-xs">
-                      {task.jiraIssueKey}
-                    </span>
-                    <span className="truncate">{task.title}</span>
-                  </button>
-                ))
+                HISTORY_GROUPS.map((group) => {
+                  const groupTasks = tasks.filter((task) =>
+                    group.statuses.includes(task.status),
+                  );
+                  if (groupTasks.length === 0) {
+                    return null;
+                  }
+                  const Icon = group.icon;
+                  return (
+                    <div key={group.label} className="flex flex-col gap-2">
+                      <p className="flex items-center gap-1.5 pt-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                        <Icon className="size-3.5" />
+                        {group.label}
+                      </p>
+                      {groupTasks.map(renderTaskRow)}
+                    </div>
+                  );
+                })
               )}
             </CardContent>
           </Card>

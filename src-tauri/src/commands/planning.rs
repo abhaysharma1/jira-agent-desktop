@@ -7,7 +7,8 @@ use uuid::Uuid;
 use crate::commands::{implementation, runtime};
 use crate::db;
 use crate::domain::{
-    AgentRun, AgentRunStatus, AgentTask, PlanApproval, PlanMessage, PlanVersion, TaskStatus,
+    AgentRun, AgentRunStatus, AgentTask, PlanApproval, PlanMessage, PlanVersion, Repository,
+    TaskStatus,
 };
 use crate::opencode::{self, PromptCallbacks};
 use crate::planning::{self, TicketInput};
@@ -80,6 +81,8 @@ pub fn start_planning(
         approved_plan_version: None,
         workspace_path: None,
         branch_name: None,
+        commit_hash: None,
+        interrupted_from: None,
         created_at: now(),
         updated_at: now(),
     };
@@ -88,8 +91,49 @@ pub fn start_planning(
         let connection = state.db.lock().map_err(|error| error.to_string())?;
         db::insert_task(&connection, &task)?;
     }
-    let _ = app.emit("task://updated", &task);
+    crate::commands::cloud_socket::emit_task_updated(&app, &state, &task.id);
 
+    spawn_planning_run(&app, &state, &task.id, ticket, repository, dir, model)?;
+    Ok(task)
+}
+
+/// Restarts planning for an existing task whose planning run was interrupted.
+/// Reuses the task row, ticket fields, and repository mapping already stored.
+pub fn resume_planning(
+    app: &AppHandle,
+    state: &AppState,
+    task: &AgentTask,
+) -> Result<(), String> {
+    let repository = {
+        let connection = state.db.lock().map_err(|error| error.to_string())?;
+        db::get_repository(&connection, &task.repository_id)?
+            .ok_or_else(|| format!("repository not found: {}", task.repository_id))?
+    };
+    let dir = PathBuf::from(&repository.local_path);
+    if !dir.is_dir() {
+        return Err(format!(
+            "repository path does not exist: {}",
+            repository.local_path
+        ));
+    }
+    let ticket = TicketInput {
+        key: task.jira_issue_key.clone(),
+        title: task.title.clone(),
+        description: task.description.clone(),
+        acceptance_criteria: None,
+    };
+    spawn_planning_run(app, state, &task.id, ticket, repository, dir, None)
+}
+
+fn spawn_planning_run(
+    app: &AppHandle,
+    state: &AppState,
+    task_id: &str,
+    ticket: TicketInput,
+    repository: Repository,
+    dir: PathBuf,
+    model: Option<String>,
+) -> Result<(), String> {
     let program = opencode::resolve_program(opencode::DEFAULT_COMMAND)?;
     let permission = opencode::READ_ONLY_PERMISSION.to_string();
     let log_dir = state.data_dir.join("logs");
@@ -117,7 +161,7 @@ pub fn start_planning(
     let run_id = Uuid::new_v4().to_string();
     let run = AgentRun {
         id: run_id.clone(),
-        task_id: task.id.clone(),
+        task_id: task_id.to_string(),
         mode: "planning".to_string(),
         agent: Some("plan".to_string()),
         status: AgentRunStatus::Running,
@@ -129,13 +173,19 @@ pub fn start_planning(
     let base_url = server.base_url.clone();
     let password = server.password.clone();
     runtime::register_run(
-        &state,
+        state,
         run,
         String::new(),
         0.0,
         Some(selected_model.clone()),
         server,
     )?;
+
+    crate::logging::info(
+        "planning",
+        "started",
+        serde_json::json!({ "taskId": task_id, "runId": run_id, "model": selected_model }),
+    );
 
     opencode::spawn_event_listener(
         app.clone(),
@@ -146,20 +196,20 @@ pub fn start_planning(
     );
 
     let prompt = planning::build_prompt(&ticket, &repository.local_path);
-    let task_id = task.id.clone();
+    let success_task = task_id.to_string();
+    let failure_task = task_id.to_string();
     let ticket_key = ticket.key.clone();
     let callbacks = PromptCallbacks {
         on_success: Some(Box::new(move |app, value| {
-            plan_success(app, &task_id, &ticket_key, value)
+            plan_success(app, &success_task, &ticket_key, value)
         })),
-        on_failure: Some(Box::new({
-            let task_id = task.id.clone();
-            move |app, error| task_failed(app, &task_id, error)
+        on_failure: Some(Box::new(move |app, error| {
+            task_failed(app, &failure_task, error)
         })),
     };
 
     opencode::spawn_prompt_with(
-        app,
+        app.clone(),
         run_id,
         base_url,
         password,
@@ -171,7 +221,7 @@ pub fn start_planning(
         callbacks,
     );
 
-    Ok(task)
+    Ok(())
 }
 
 fn plan_success(app: &AppHandle, task_id: &str, ticket_key: &str, value: &Value) {
@@ -253,6 +303,11 @@ fn commit_revision(app: &AppHandle, task_id: &str, ticket_key: &str, value: &Val
 }
 
 fn task_failed(app: &AppHandle, task_id: &str, error: &str) {
+    crate::logging::error(
+        "planning",
+        "task failed",
+        serde_json::json!({ "taskId": task_id, "error": error }),
+    );
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(connection) = state.db.lock() {
             let _ = db::update_task_status(&connection, task_id, TaskStatus::Failed, &now());
@@ -327,11 +382,7 @@ pub fn approve_plan(
         db::approve_plan(&connection, &task_id, plan_version, &user, &now())?
     };
 
-    if let Ok(connection) = state.db.lock() {
-        if let Ok(Some(task)) = db::get_task(&connection, &task_id) {
-            let _ = app.emit("task://updated", &task);
-        }
-    }
+    crate::commands::cloud_socket::emit_task_updated(&app, &state, &task_id);
     let _ = app.emit(
         "plan://approved",
         serde_json::json!({ "taskId": &task_id, "approval": &approval }),
@@ -357,7 +408,7 @@ pub fn reject_plan(
         let connection = state.db.lock().map_err(|error| error.to_string())?;
         db::reject_plan(&connection, &task_id, &now())?
     };
-    let _ = app.emit("task://updated", &task);
+    crate::commands::cloud_socket::emit_task_updated(&app, &state, &task_id);
     Ok(task)
 }
 

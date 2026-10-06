@@ -19,6 +19,7 @@ pub enum TaskStatus {
     PrCreating,
     PrCreated,
     WaitingForReview,
+    Interrupted,
     Failed,
 }
 
@@ -42,6 +43,10 @@ impl TaskStatus {
             PrCreating => &[PrCreated, Failed],
             PrCreated => &[WaitingForReview, Failed],
             WaitingForReview => &[],
+            // Interrupted tasks are recovered by restarting the stage recorded
+            // in `interrupted_from`; the transition table lists those entry
+            // points so the UI can reason about a resume.
+            Interrupted => &[Planning, Approved, Testing, Validating, Committing, PrCreating],
             Failed => &[],
         }
     }
@@ -97,6 +102,10 @@ pub struct AgentTask {
     pub approved_plan_version: Option<u32>,
     pub workspace_path: Option<String>,
     pub branch_name: Option<String>,
+    pub commit_hash: Option<String>,
+    /// The status the task was in when the app shut down mid-run. Set only
+    /// while `status == Interrupted`, cleared on resume.
+    pub interrupted_from: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -346,6 +355,36 @@ pub struct WorkspaceStatus {
     pub current_branch: Option<String>,
 }
 
+/// A spawned `opencode serve` process, persisted so a crash can be recovered:
+/// on the next start we health-check the recorded port (the password proves the
+/// server is ours) and terminate the orphan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpencodeServer {
+    pub run_id: String,
+    pub task_id: String,
+    pub pid: u32,
+    pub port: u16,
+    pub password: String,
+    pub started_at: String,
+}
+
+/// Where a search result came from. Serialized lowercase so the UI can group by
+/// kind without a lookup table.
+pub type SearchKind = String;
+
+/// A single hit from [`crate::db::search`]. `route` is a frontend hash route the
+/// command palette can navigate to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHit {
+    pub kind: SearchKind,
+    pub title: String,
+    pub subtitle: String,
+    pub route: String,
+    pub task_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequest {
@@ -429,6 +468,118 @@ pub struct TestRun {
     pub exit_code: i32,
     pub output: String,
     pub created_at: String,
+}
+
+/// A single observability measurement (Phase 26). `dims` carries the
+/// event-specific detail (attempt, success, additions, error, …) so one table
+/// can hold every tracked metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Metric {
+    pub id: String,
+    pub name: String,
+    pub value: f64,
+    pub task_id: Option<String>,
+    pub dims: serde_json::Value,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraIssue {
+    pub key: String,
+    pub id: String,
+    pub summary: String,
+    pub description: String,
+    pub status: String,
+    pub issue_type: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraTransition {
+    pub id: String,
+    pub name: String,
+    pub to_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraSync {
+    pub id: String,
+    pub task_id: String,
+    pub jira_issue_key: String,
+    pub jira_issue_id: Option<String>,
+    pub pr_number: Option<u32>,
+    pub last_action: Option<String>,
+    pub last_synced_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraStatusMap {
+    pub opened: Option<String>,
+    pub merged: Option<String>,
+    pub closed: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraConnectionInfo {
+    pub account: Option<String>,
+    pub cloud_id: String,
+    pub site_url: String,
+    pub site_name: Option<String>,
+    pub webhook_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraProjectRepo {
+    pub id: String,
+    pub project_key: String,
+    pub repository_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudAccount {
+    pub base_url: String,
+    pub email: String,
+    pub device_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudNotification {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
+    pub created_at: String,
+    #[serde(default)]
+    pub read_at: Option<String>,
+}
+
+/// The result of resolving a JIRA ticket into everything needed to start
+/// planning: the matched local repository (if the project is mapped) and the
+/// full issue pulled from JIRA.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketIntake {
+    pub repository_id: Option<String>,
+    pub issue: JiraIssue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

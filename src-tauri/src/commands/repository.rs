@@ -8,10 +8,6 @@ use crate::git;
 use crate::repository;
 use crate::state::AppState;
 
-pub fn not_implemented(feature: &str) -> String {
-    format!("{feature} is not implemented yet")
-}
-
 fn build_status(repository: &Repository) -> RepositoryStatus {
     let path = Path::new(&repository.local_path);
     let changed_files = git::changed_files(path).unwrap_or_default();

@@ -15,6 +15,7 @@ export type TaskStatus =
   | "PR_CREATING"
   | "PR_CREATED"
   | "WAITING_FOR_REVIEW"
+  | "INTERRUPTED"
   | "FAILED";
 
 export const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
@@ -34,6 +35,16 @@ export const TASK_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   PR_CREATING: ["PR_CREATED", "FAILED"],
   PR_CREATED: ["WAITING_FOR_REVIEW", "FAILED"],
   WAITING_FOR_REVIEW: [],
+  // Recovery clears INTERRUPTED by resetting to the recorded stage's entry
+  // point, then restarting that stage.
+  INTERRUPTED: [
+    "PLANNING",
+    "APPROVED",
+    "TESTING",
+    "VALIDATING",
+    "COMMITTING",
+    "PR_CREATING",
+  ],
   FAILED: [],
 };
 
@@ -86,6 +97,9 @@ export interface AgentTask {
 
   workspacePath?: string;
   branchName?: string;
+  commitHash?: string | null;
+
+  interruptedFrom?: string | null;
 
   createdAt: string;
   updatedAt: string;
@@ -311,6 +325,108 @@ export interface AppInfo {
   version: string;
   tauriVersion: string;
   platform: string;
+}
+
+export interface CloudAccount {
+  baseUrl: string;
+  email: string;
+  deviceId?: string | null;
+}
+
+export interface JiraIssue {
+  key: string;
+  id: string;
+  summary: string;
+  description: string;
+  status: string;
+  issueType: string;
+  url: string;
+}
+
+export interface CloudNotification {
+  id: string;
+  type: string;
+  title: string;
+  body?: string | null;
+  taskId?: string | null;
+  payload?: Record<string, unknown> | null;
+  createdAt: string;
+  readAt?: string | null;
+}
+
+export interface TicketIntake {
+  repositoryId?: string | null;
+  issue: JiraIssue;
+}
+
+/** Where a command-palette search result came from. */
+export type SearchKind = "ticket" | "plan" | "pull_request" | "agent_run";
+
+export interface SearchHit {
+  kind: SearchKind;
+  title: string;
+  subtitle: string;
+  /** Hash route the palette navigates to when the hit is chosen. */
+  route: string;
+  taskId: string;
+}
+
+export type CloudSocketStatus = "signedOut" | "connecting" | "online" | "offline";
+
+/** A server-pushed WebSocket event: `{ event, ...payload }`. */
+export interface CloudEvent {
+  event: string;
+  [key: string]: unknown;
+}
+
+export interface JiraTransition {
+  id: string;
+  name: string;
+  toStatus: string;
+}
+
+export interface JiraSync {
+  id: string;
+  taskId: string;
+  jiraIssueKey: string;
+  jiraIssueId?: string | null;
+  prNumber?: number | null;
+  lastAction?: string | null;
+  lastSyncedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface JiraStatusMap {
+  opened?: string;
+  merged?: string;
+  closed?: string;
+}
+
+export interface JiraConnectionInfo {
+  account?: string | null;
+  cloudId: string;
+  siteUrl: string;
+  siteName?: string | null;
+  webhookUrl?: string | null;
+}
+
+export interface JiraProjectRepo {
+  id: string;
+  projectKey: string;
+  repositoryId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A single observability measurement (Phase 26). */
+export interface Metric {
+  id: string;
+  name: string;
+  value: number;
+  taskId?: string | null;
+  dims: Record<string, unknown>;
+  createdAt: string;
 }
 
 export interface Settings {

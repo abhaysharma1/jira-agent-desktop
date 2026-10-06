@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -33,15 +34,18 @@ fn set_status(app: &AppHandle, task_id: &str, status: TaskStatus) {
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(connection) = state.db.lock() {
             let _ = db::update_task_status(&connection, task_id, status, &now());
-            if let Ok(Some(task)) = db::get_task(&connection, task_id) {
-                let _ = app.emit("task://updated", &task);
-            }
         }
+        crate::commands::cloud_socket::emit_task_updated(app, &state, task_id);
     }
 }
 
 fn fail(app: &AppHandle, task_id: &str, error: &str) {
     set_status(app, task_id, TaskStatus::Failed);
+    crate::logging::error(
+        "validation",
+        "task failed",
+        serde_json::json!({ "taskId": task_id, "error": error }),
+    );
     let _ = app.emit(
         "validation://error",
         serde_json::json!({ "taskId": task_id, "error": error }),
@@ -97,10 +101,20 @@ fn run_loop(app: &AppHandle, task_id: &str, model: Option<String>) {
         return;
     };
 
+    let mut repairs = 0u32;
     for attempt in 1..=max_attempts {
         set_status(app, task_id, TaskStatus::Testing);
+        let started = Instant::now();
         let (exit_code, output) = validation::run_command(&workspace, &test_command);
+        let elapsed_ms = started.elapsed().as_millis() as f64;
         let passed = exit_code == 0;
+        crate::metrics::record(
+            app,
+            "test.duration_ms",
+            elapsed_ms,
+            Some(task_id),
+            serde_json::json!({ "phase": "test", "attempt": attempt, "passed": passed }),
+        );
         let test_run = TestRun {
             id: Uuid::new_v4().to_string(),
             task_id: task_id.to_string(),
@@ -119,12 +133,26 @@ fn run_loop(app: &AppHandle, task_id: &str, model: Option<String>) {
         let _ = app.emit("test://result", &test_run);
 
         if passed {
+            crate::metrics::record(
+                app,
+                "repair.attempts",
+                repairs as f64,
+                Some(task_id),
+                serde_json::json!({ "phase": "test", "outcome": "passed" }),
+            );
             set_status(app, task_id, TaskStatus::Validating);
             start_final_validation(app.clone(), task_id.to_string());
             return;
         }
 
         if attempt == max_attempts {
+            crate::metrics::record(
+                app,
+                "repair.attempts",
+                repairs as f64,
+                Some(task_id),
+                serde_json::json!({ "phase": "test", "outcome": "failed" }),
+            );
             fail(
                 app,
                 task_id,
@@ -137,9 +165,17 @@ fn run_loop(app: &AppHandle, task_id: &str, model: Option<String>) {
         let plan_content = plan.clone().unwrap_or_else(empty_plan);
         let prompt = validation::build_repair_prompt(&ticket, &plan_content, &output);
         if let Err(error) = send_repair(app, task_id, &workspace_path, prompt, model.clone()) {
+            crate::metrics::record(
+                app,
+                "repair.attempts",
+                repairs as f64,
+                Some(task_id),
+                serde_json::json!({ "phase": "test", "outcome": "error" }),
+            );
             fail(app, task_id, &error);
             return;
         }
+        repairs += 1;
     }
 }
 
@@ -324,8 +360,10 @@ fn run_validation_loop(app: &AppHandle, task_id: &str) {
     let steps = validation::build_validation_steps(&config);
     let attempts = if repair_enabled { max_attempts } else { 1 };
 
+    let mut repairs = 0u32;
     for attempt in 1..=attempts {
         set_status(app, task_id, TaskStatus::Validating);
+        let started = Instant::now();
         let mut results = Vec::new();
         for command in &steps {
             let (exit_code, output) = validation::run_command(&workspace, command);
@@ -336,7 +374,15 @@ fn run_validation_loop(app: &AppHandle, task_id: &str) {
                 output,
             });
         }
+        let elapsed_ms = started.elapsed().as_millis() as f64;
         let passed = results.iter().all(|result| result.passed);
+        crate::metrics::record(
+            app,
+            "test.duration_ms",
+            elapsed_ms,
+            Some(task_id),
+            serde_json::json!({ "phase": "validation", "attempt": attempt, "passed": passed }),
+        );
         let run = ValidationRun {
             id: Uuid::new_v4().to_string(),
             task_id: task_id.to_string(),
@@ -352,7 +398,15 @@ fn run_validation_loop(app: &AppHandle, task_id: &str) {
         let _ = app.emit("validation://result", &run);
 
         if passed {
+            crate::metrics::record(
+                app,
+                "repair.attempts",
+                repairs as f64,
+                Some(task_id),
+                serde_json::json!({ "phase": "validation", "outcome": "passed" }),
+            );
             set_status(app, task_id, TaskStatus::Committing);
+            crate::commands::git::start_commit(app.clone(), task_id.to_string());
             return;
         }
 
@@ -363,6 +417,13 @@ fn run_validation_loop(app: &AppHandle, task_id: &str) {
                 .map(|result| result.command.clone())
                 .collect::<Vec<_>>()
                 .join(", ");
+            crate::metrics::record(
+                app,
+                "repair.attempts",
+                repairs as f64,
+                Some(task_id),
+                serde_json::json!({ "phase": "validation", "outcome": "failed" }),
+            );
             fail(app, task_id, &format!("Validation failed: {failing}"));
             return;
         }
@@ -377,9 +438,17 @@ fn run_validation_loop(app: &AppHandle, task_id: &str) {
         let plan_content = plan.clone().unwrap_or_else(empty_plan);
         let prompt = validation::build_repair_prompt(&ticket, &plan_content, &failing_output);
         if let Err(error) = send_repair(app, task_id, &workspace_path, prompt, None) {
+            crate::metrics::record(
+                app,
+                "repair.attempts",
+                repairs as f64,
+                Some(task_id),
+                serde_json::json!({ "phase": "validation", "outcome": "error" }),
+            );
             fail(app, task_id, &error);
             return;
         }
+        repairs += 1;
     }
 }
 

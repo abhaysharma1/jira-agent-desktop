@@ -5,11 +5,12 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::domain::{
-    AgentEvent, AgentRun, AgentTask, Plan, PlanApproval, PlanContent, PlanMessage, PlanVersion,
-    Repository, TaskStatus, TestRun, ValidationConfig, ValidationResult, ValidationRun, Workspace,
+    AgentEvent, AgentRun, AgentTask, JiraProjectRepo, JiraSync, Metric, OpencodeServer, Plan,
+    PlanApproval, PlanContent, PlanMessage, PlanVersion, PullRequest, Repository, SearchHit,
+    TaskStatus, TestRun, ValidationConfig, ValidationResult, ValidationRun, Workspace,
 };
 
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 8;
 
 pub fn open(path: &Path) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| error.to_string())?;
@@ -61,6 +62,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     approved_plan_version INTEGER,
     workspace_path TEXT,
     branch_name TEXT,
+    commit_hash TEXT,
+    interrupted_from TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -168,9 +171,65 @@ CREATE TABLE IF NOT EXISTS validation_runs (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_validation_runs_task ON validation_runs(task_id);
+
+CREATE TABLE IF NOT EXISTS jira_issue_sync (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    jira_issue_key TEXT NOT NULL,
+    jira_issue_id TEXT,
+    pr_number INTEGER,
+    last_action TEXT,
+    last_synced_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS jira_project_repos (
+    id TEXT PRIMARY KEY,
+    project_key TEXT NOT NULL UNIQUE,
+    repository_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS opencode_servers (
+    run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    pid INTEGER NOT NULL,
+    port INTEGER NOT NULL,
+    password TEXT NOT NULL,
+    started_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS metrics (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    value REAL NOT NULL,
+    task_id TEXT,
+    dims_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name, created_at);
 "#,
         )
         .map_err(|error| error.to_string())?;
+
+    // Phase 20 replaced API-token auth with OAuth; drop the legacy connection.
+    connection
+        .execute("DELETE FROM settings WHERE key = 'jiraConnection'", [])
+        .map_err(|error| error.to_string())?;
+
+    if !column_exists(&connection, "tasks", "commit_hash")? {
+        connection
+            .execute("ALTER TABLE tasks ADD COLUMN commit_hash TEXT", [])
+            .map_err(|error| error.to_string())?;
+    }
+
+    if !column_exists(&connection, "tasks", "interrupted_from")? {
+        connection
+            .execute("ALTER TABLE tasks ADD COLUMN interrupted_from TEXT", [])
+            .map_err(|error| error.to_string())?;
+    }
 
     connection
         .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
@@ -178,20 +237,45 @@ CREATE INDEX IF NOT EXISTS idx_validation_runs_task ON validation_runs(task_id);
     Ok(())
 }
 
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let name: String = row.get(1).map_err(|error| error.to_string())?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Recovers tasks that were mid-run when the app last exited (cleanly or not).
+/// They become `INTERRUPTED` with the stage recorded in `interrupted_from`, so
+/// the UI can offer a Resume that restarts exactly that stage. Running agent
+/// runs are closed out as failed.
 pub fn recover_interrupted(connection: &Connection) -> Result<(), String> {
     connection
         .execute(
-            "UPDATE tasks SET status = 'FAILED' WHERE status IN (
-                'PLANNING', 'WORKSPACE_CREATING', 'IMPLEMENTING', 'TESTING',
+            "UPDATE tasks
+             SET interrupted_from = status, status = 'INTERRUPTED', updated_at = ?1
+             WHERE status IN (
+                'PLANNING', 'APPROVED', 'WORKSPACE_CREATING', 'IMPLEMENTING', 'TESTING',
                 'REPAIRING', 'VALIDATING', 'COMMITTING', 'PR_CREATING'
-            )",
-            [],
+             )",
+            params![now()],
         )
         .map_err(|error| error.to_string())?;
     connection
         .execute(
-            "UPDATE agent_runs SET status = 'FAILED' WHERE status IN ('PENDING', 'RUNNING')",
-            [],
+            "UPDATE agent_runs SET status = 'FAILED', completed_at = ?1
+             WHERE status IN ('PENDING', 'RUNNING')",
+            params![now()],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -417,8 +501,9 @@ pub fn insert_task(connection: &Connection, task: &AgentTask) -> Result<(), Stri
         .execute(
             "INSERT OR REPLACE INTO tasks
              (id, jira_issue_key, title, description, repository_id, status, plan_version,
-              approved_plan_version, workspace_path, branch_name, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
+              created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 task.id,
                 task.jira_issue_key,
@@ -430,6 +515,8 @@ pub fn insert_task(connection: &Connection, task: &AgentTask) -> Result<(), Stri
                 task.approved_plan_version,
                 task.workspace_path,
                 task.branch_name,
+                task.commit_hash,
+                task.interrupted_from,
                 task.created_at,
                 task.updated_at,
             ],
@@ -451,8 +538,10 @@ fn row_to_task(row: &Row) -> rusqlite::Result<AgentTask> {
         approved_plan_version: row.get(7)?,
         workspace_path: row.get(8)?,
         branch_name: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        commit_hash: row.get(10)?,
+        interrupted_from: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -460,7 +549,8 @@ pub fn list_tasks(connection: &Connection) -> Result<Vec<AgentTask>, String> {
     let mut statement = connection
         .prepare(
             "SELECT id, jira_issue_key, title, description, repository_id, status, plan_version,
-                    approved_plan_version, workspace_path, branch_name, created_at, updated_at
+                    approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
+                    created_at, updated_at
              FROM tasks ORDER BY created_at DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -475,7 +565,8 @@ pub fn get_task(connection: &Connection, id: &str) -> Result<Option<AgentTask>, 
     connection
         .query_row(
             "SELECT id, jira_issue_key, title, description, repository_id, status, plan_version,
-                    approved_plan_version, workspace_path, branch_name, created_at, updated_at
+                    approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
+                    created_at, updated_at
              FROM tasks WHERE id = ?1",
             params![id],
             row_to_task,
@@ -499,6 +590,22 @@ pub fn update_task_status(
     Ok(())
 }
 
+/// Moves a task to `status` and clears the crash marker. Used by resume.
+pub fn set_task_running_state(
+    connection: &Connection,
+    task_id: &str,
+    status: TaskStatus,
+    updated_at: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE tasks SET status = ?1, interrupted_from = NULL, updated_at = ?2 WHERE id = ?3",
+            params![enum_to_string(&status), updated_at, task_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 pub fn set_task_workspace(
     connection: &Connection,
     task_id: &str,
@@ -510,6 +617,21 @@ pub fn set_task_workspace(
         .execute(
             "UPDATE tasks SET workspace_path = ?1, branch_name = ?2, updated_at = ?3 WHERE id = ?4",
             params![path, branch, updated_at, task_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn set_task_commit(
+    connection: &Connection,
+    task_id: &str,
+    commit_hash: &str,
+    updated_at: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE tasks SET commit_hash = ?1, updated_at = ?2 WHERE id = ?3",
+            params![commit_hash, updated_at, task_id],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -791,7 +913,8 @@ pub fn approve_plan(
     let task = transaction
         .query_row(
             "SELECT id, jira_issue_key, title, description, repository_id, status, plan_version,
-                    approved_plan_version, workspace_path, branch_name, created_at, updated_at
+                    approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
+                    created_at, updated_at
              FROM tasks WHERE id = ?1",
             params![task_id],
             row_to_task,
@@ -1123,6 +1246,88 @@ pub fn list_validation_runs(
         .map_err(|error| error.to_string())
 }
 
+fn row_to_jira_project_repo(row: &Row) -> rusqlite::Result<JiraProjectRepo> {
+    Ok(JiraProjectRepo {
+        id: row.get(0)?,
+        project_key: row.get(1)?,
+        repository_id: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+pub fn upsert_jira_project_repo(
+    connection: &Connection,
+    project_key: &str,
+    repository_id: &str,
+) -> Result<JiraProjectRepo, String> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let existing: Option<(String, String)> = connection
+        .query_row(
+            "SELECT id, created_at FROM jira_project_repos WHERE project_key = ?1",
+            params![project_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let (id, created_at) = existing.unwrap_or_else(|| {
+        (
+            uuid::Uuid::new_v4().to_string(),
+            timestamp.clone(),
+        )
+    });
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO jira_project_repos
+             (id, project_key, repository_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, project_key, repository_id, created_at, timestamp],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(JiraProjectRepo {
+        id,
+        project_key: project_key.to_string(),
+        repository_id: repository_id.to_string(),
+        created_at,
+        updated_at: timestamp,
+    })
+}
+
+pub fn list_jira_project_repos(connection: &Connection) -> Result<Vec<JiraProjectRepo>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, project_key, repository_id, created_at, updated_at
+             FROM jira_project_repos ORDER BY project_key",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], row_to_jira_project_repo)
+        .map_err(|error| error.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())
+}
+
+pub fn delete_jira_project_repo(connection: &Connection, project_key: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM jira_project_repos WHERE project_key = ?1",
+            params![project_key],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[allow(dead_code)] // used by ticket intake in a later phase
+pub fn find_repository_for_project(connection: &Connection, project_key: &str) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT repository_id FROM jira_project_repos WHERE project_key = ?1",
+            params![project_key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
 pub fn get_setting(connection: &Connection, key: &str) -> Option<serde_json::Value> {
     connection
         .query_row(
@@ -1154,6 +1359,434 @@ pub fn repair_on_validation_failure(connection: &Connection) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the window's close button hides to the tray instead of quitting.
+/// Defaults to true so the tray is reachable the first time the app runs.
+pub fn close_to_tray(connection: &Connection) -> bool {
+    get_setting(connection, "closeToTray")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+}
+
+// ------------------------------------------------------------ opencode servers
+
+pub fn record_opencode_server(
+    connection: &Connection,
+    server: &OpencodeServer,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO opencode_servers
+             (run_id, task_id, pid, port, password, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                server.run_id,
+                server.task_id,
+                server.pid,
+                server.port,
+                server.password,
+                server.started_at,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn delete_opencode_server(connection: &Connection, run_id: &str) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM opencode_servers WHERE run_id = ?1",
+            params![run_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Rewrites the stored server password (used to encrypt legacy plaintext rows).
+pub fn update_opencode_server_password(
+    connection: &Connection,
+    run_id: &str,
+    password: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE opencode_servers SET password = ?1 WHERE run_id = ?2",
+            params![password, run_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub fn list_opencode_servers(connection: &Connection) -> Result<Vec<OpencodeServer>, String> {
+    let mut statement = connection
+        .prepare("SELECT run_id, task_id, pid, port, password, started_at FROM opencode_servers")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(OpencodeServer {
+                run_id: row.get(0)?,
+                task_id: row.get(1)?,
+                pid: row.get(2)?,
+                port: row.get(3)?,
+                password: row.get(4)?,
+                started_at: row.get(5)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())
+}
+
+pub fn insert_pull_request(connection: &Connection, pull_request: &PullRequest) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO pull_requests
+             (id, task_id, provider, number, url, branch, base_branch, status, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                pull_request.id,
+                pull_request.task_id,
+                pull_request.provider,
+                pull_request.number,
+                pull_request.url,
+                pull_request.branch,
+                pull_request.base_branch,
+                pull_request.status,
+                pull_request.created_at,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn row_to_pull_request(row: &Row) -> rusqlite::Result<PullRequest> {
+    Ok(PullRequest {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        provider: row.get(2)?,
+        number: row.get(3)?,
+        url: row.get(4)?,
+        branch: row.get(5)?,
+        base_branch: row.get(6)?,
+        status: row.get(7)?,
+        created_at: row.get(8)?,
+    })
+}
+
+pub fn get_pull_request(
+    connection: &Connection,
+    task_id: &str,
+) -> Result<Option<PullRequest>, String> {
+    connection
+        .query_row(
+            "SELECT id, task_id, provider, number, url, branch, base_branch, status, created_at
+             FROM pull_requests WHERE task_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            params![task_id],
+            row_to_pull_request,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
+// ------------------------------------------------------------------- metrics
+
+pub fn insert_metric(connection: &Connection, metric: &Metric) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO metrics (id, name, value, task_id, dims_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                metric.id,
+                metric.name,
+                metric.value,
+                metric.task_id,
+                json(&metric.dims)?,
+                metric.created_at,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn row_to_metric(row: &Row) -> rusqlite::Result<Metric> {
+    let dims: String = row.get(4)?;
+    Ok(Metric {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        value: row.get(2)?,
+        task_id: row.get(3)?,
+        dims: from_json::<serde_json::Value>(&dims).unwrap_or(serde_json::Value::Null),
+        created_at: row.get(5)?,
+    })
+}
+
+/// Newest first. `name` filters to a single metric; `None` lists everything.
+pub fn list_metrics(
+    connection: &Connection,
+    name: Option<&str>,
+    limit: usize,
+) -> Result<Vec<Metric>, String> {
+    let limit = limit as i64;
+    let sql = match name {
+        Some(_) => {
+            "SELECT id, name, value, task_id, dims_json, created_at FROM metrics
+             WHERE name = ?1 ORDER BY created_at DESC, rowid DESC LIMIT ?2"
+        }
+        None => {
+            "SELECT id, name, value, task_id, dims_json, created_at FROM metrics
+             ORDER BY created_at DESC, rowid DESC LIMIT ?1"
+        }
+    };
+    let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
+    let map_row = |row: &Row| row_to_metric(row);
+    let rows = match name {
+        Some(name) => statement
+            .query_map(params![name, limit], map_row)
+            .map_err(|error| error.to_string())?,
+        None => statement
+            .query_map(params![limit], map_row)
+            .map_err(|error| error.to_string())?,
+    };
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())
+}
+
+/// Deletes everything but the newest `keep` rows, oldest first.
+pub fn prune_metrics(connection: &Connection, keep: i64) -> Result<(), String> {
+    connection
+        .execute(
+            "DELETE FROM metrics WHERE id NOT IN (
+                SELECT id FROM metrics ORDER BY created_at DESC, rowid DESC LIMIT ?1
+             )",
+            params![keep.max(0)],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+// --------------------------------------------------------------------- search
+
+/// Case-insensitive (ASCII) substring search across everything the command
+/// palette can open: tickets, plans, pull requests and agent runs. Each source
+/// is limited independently so one noisy category cannot crowd out the rest.
+pub fn search(
+    connection: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>, String> {
+    let query = query.trim();
+    if query.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let like = format!("%{query}%");
+    let limit = limit as i64;
+    let mut hits = Vec::new();
+
+    // Tickets — an exact issue-key match ranks above a fuzzy title match.
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, jira_issue_key, title FROM tasks
+                 WHERE jira_issue_key LIKE ?1 OR title LIKE ?1 OR description LIKE ?1
+                 ORDER BY CASE WHEN jira_issue_key = ?2 THEN 0 ELSE 1 END, updated_at DESC
+                 LIMIT ?3",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![like, query, limit], |row| {
+                let id: String = row.get(0)?;
+                let key: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                Ok(SearchHit {
+                    kind: "ticket".to_string(),
+                    title: format!("{key}: {title}"),
+                    subtitle: "Ticket".to_string(),
+                    route: format!("/tasks/{id}"),
+                    task_id: id,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        hits.extend(
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?,
+        );
+    }
+
+    // Plans — the newest version per task, summarised from its content JSON.
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT pv.task_id, t.jira_issue_key, pv.content_json, pv.version
+                 FROM plan_versions pv
+                 LEFT JOIN tasks t ON t.id = pv.task_id
+                 WHERE pv.content_json LIKE ?1
+                 GROUP BY pv.task_id
+                 ORDER BY pv.created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![like, limit], |row| {
+                let task_id: String = row.get(0)?;
+                let key: Option<String> = row.get(1)?;
+                let content: String = row.get(2)?;
+                let version: u32 = row.get(3)?;
+                let summary = serde_json::from_str::<PlanContent>(&content)
+                    .map(|plan| plan.summary)
+                    .unwrap_or_else(|_| content.chars().take(60).collect());
+                Ok(SearchHit {
+                    kind: "plan".to_string(),
+                    title: format!(
+                        "{}: {summary}",
+                        key.unwrap_or_else(|| "Plan".to_string())
+                    ),
+                    subtitle: format!("Plan v{version}"),
+                    route: format!("/tasks/{task_id}"),
+                    task_id,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        hits.extend(
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?,
+        );
+    }
+
+    // Pull requests.
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT pr.task_id, t.jira_issue_key, pr.number, pr.url, pr.status
+                 FROM pull_requests pr
+                 LEFT JOIN tasks t ON t.id = pr.task_id
+                 WHERE t.jira_issue_key LIKE ?1 OR pr.url LIKE ?1 OR pr.branch LIKE ?1
+                    OR CAST(pr.number AS TEXT) LIKE ?1
+                 ORDER BY pr.created_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![like, limit], |row| {
+                let task_id: String = row.get(0)?;
+                let key: Option<String> = row.get(1)?;
+                let number: Option<i64> = row.get(2)?;
+                let url: String = row.get(3)?;
+                let status: String = row.get(4)?;
+                let label = number
+                    .map(|number| format!("PR #{number}"))
+                    .unwrap_or_else(|| url.clone());
+                Ok(SearchHit {
+                    kind: "pull_request".to_string(),
+                    title: format!(
+                        "{label} · {}",
+                        key.unwrap_or_else(|| "pull request".to_string())
+                    ),
+                    subtitle: format!("Pull request · {status}"),
+                    route: format!("/tasks/{task_id}"),
+                    task_id,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        hits.extend(
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?,
+        );
+    }
+
+    // Agent runs.
+    {
+        let mut statement = connection
+            .prepare(
+                "SELECT ar.task_id, t.jira_issue_key, ar.mode, ar.status
+                 FROM agent_runs ar
+                 LEFT JOIN tasks t ON t.id = ar.task_id
+                 WHERE ar.output LIKE ?1 OR ar.model LIKE ?1 OR ar.mode LIKE ?1
+                    OR t.jira_issue_key LIKE ?1
+                 ORDER BY ar.started_at DESC
+                 LIMIT ?2",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(params![like, limit], |row| {
+                let task_id: String = row.get(0)?;
+                let key: Option<String> = row.get(1)?;
+                let mode: String = row.get(2)?;
+                let status: String = row.get(3)?;
+                Ok(SearchHit {
+                    kind: "agent_run".to_string(),
+                    title: format!(
+                        "{mode} · {}",
+                        key.unwrap_or_else(|| "agent run".to_string())
+                    ),
+                    subtitle: format!("Agent run · {status}"),
+                    route: format!("/tasks/{task_id}/run"),
+                    task_id,
+                })
+            })
+            .map_err(|error| error.to_string())?;
+        hits.extend(
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|error| error.to_string())?,
+        );
+    }
+
+    Ok(hits)
+}
+
+pub fn upsert_jira_sync(connection: &Connection, sync: &JiraSync) -> Result<(), String> {
+    connection
+        .execute(
+            "INSERT INTO jira_issue_sync
+             (id, task_id, jira_issue_key, jira_issue_id, pr_number, last_action, last_synced_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(task_id) DO UPDATE SET
+                 jira_issue_key = excluded.jira_issue_key,
+                 jira_issue_id = excluded.jira_issue_id,
+                 pr_number = excluded.pr_number,
+                 last_action = excluded.last_action,
+                 last_synced_at = excluded.last_synced_at,
+                 updated_at = excluded.updated_at",
+            params![
+                sync.id,
+                sync.task_id,
+                sync.jira_issue_key,
+                sync.jira_issue_id,
+                sync.pr_number,
+                sync.last_action,
+                sync.last_synced_at,
+                sync.created_at,
+                sync.updated_at,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn row_to_jira_sync(row: &Row) -> rusqlite::Result<JiraSync> {
+    Ok(JiraSync {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        jira_issue_key: row.get(2)?,
+        jira_issue_id: row.get(3)?,
+        pr_number: row.get(4)?,
+        last_action: row.get(5)?,
+        last_synced_at: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
+}
+
+pub fn get_jira_sync(connection: &Connection, task_id: &str) -> Result<Option<JiraSync>, String> {
+    connection
+        .query_row(
+            "SELECT id, task_id, jira_issue_key, jira_issue_id, pr_number, last_action, last_synced_at, created_at, updated_at
+             FROM jira_issue_sync WHERE task_id = ?1",
+            params![task_id],
+            row_to_jira_sync,
+        )
+        .optional()
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1177,6 +1810,8 @@ mod tests {
             approved_plan_version: None,
             workspace_path: None,
             branch_name: None,
+            commit_hash: None,
+            interrupted_from: None,
             created_at: "t0".to_string(),
             updated_at: "t0".to_string(),
         }
@@ -1195,6 +1830,87 @@ mod tests {
             tests: vec!["t".to_string()],
             risks: vec![],
         }
+    }
+
+    #[test]
+    fn searches_across_tickets_plans_pull_requests_and_runs() {
+        let connection = memory();
+        insert_task(&connection, &sample_task("task-1", TaskStatus::PlanReady)).unwrap();
+        // A distinctive token only the plan summary carries.
+        let mut content = sample_content();
+        content.summary = "Add pagination to the widget list".to_string();
+        store_plan_version(&connection, "task-1", content, "agent", "t1").unwrap();
+        insert_pull_request(
+            &connection,
+            &crate::domain::PullRequest {
+                id: "pr-1".to_string(),
+                task_id: "task-1".to_string(),
+                provider: "github".to_string(),
+                number: 42,
+                url: "https://github.com/acme/demo/pull/42".to_string(),
+                branch: "CC-1-widget-list".to_string(),
+                base_branch: "main".to_string(),
+                status: "open".to_string(),
+                created_at: "t2".to_string(),
+            },
+        )
+        .unwrap();
+        upsert_agent_run(
+            &connection,
+            &crate::domain::AgentRun {
+                id: "run-1".to_string(),
+                task_id: "task-1".to_string(),
+                mode: "plan".to_string(),
+                agent: None,
+                status: crate::domain::AgentRunStatus::Succeeded,
+                session_id: None,
+                started_at: "t3".to_string(),
+                completed_at: None,
+            },
+            "finished planning the widget list",
+            0.0,
+            Some("deepseek/deepseek-chat"),
+        )
+        .unwrap();
+
+        let kinds = |query: &str| {
+            let mut kinds: Vec<String> = search(&connection, query, 10)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.kind)
+                .collect();
+            kinds.sort();
+            kinds
+        };
+
+        // Every source has a route back to its task.
+        for hit in search(&connection, "CC-1", 10).unwrap() {
+            assert!(hit.route.starts_with("/tasks/task-1"));
+        }
+
+        assert_eq!(
+            kinds("CC-1"),
+            vec!["agent_run", "plan", "pull_request", "ticket"]
+        );
+        assert_eq!(kinds("pagination"), vec!["plan"]);
+        assert_eq!(kinds("42"), vec!["pull_request"]);
+        assert_eq!(kinds("finished planning"), vec!["agent_run"]);
+        // Case-insensitive, and matches reduce to the sources that carry it.
+        assert_eq!(kinds("WIDGET"), vec!["agent_run", "plan", "pull_request"]);
+
+        assert!(search(&connection, "zzz-nope", 10).unwrap().is_empty());
+        assert!(search(&connection, "   ", 10).unwrap().is_empty());
+
+        // The limit is per source, so four categories still each contribute one.
+        assert_eq!(search(&connection, "CC-1", 1).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn close_to_tray_defaults_on_and_persists() {
+        let connection = memory();
+        assert!(close_to_tray(&connection));
+        set_setting(&connection, "closeToTray", &serde_json::json!(false)).unwrap();
+        assert!(!close_to_tray(&connection));
     }
 
     #[test]
@@ -1261,11 +1977,63 @@ mod tests {
         insert_task(&connection, &sample_task("task-a", TaskStatus::Implementing)).unwrap();
         insert_task(&connection, &sample_task("task-b", TaskStatus::PlanReady)).unwrap();
         recover_interrupted(&connection).unwrap();
-        // first task marked failed; second untouched
         let tasks = list_tasks(&connection).unwrap();
-        let statuses: Vec<TaskStatus> = tasks.iter().map(|task| task.status).collect();
-        assert!(statuses.contains(&TaskStatus::Failed));
-        assert!(statuses.contains(&TaskStatus::PlanReady));
+        let recovered = tasks.iter().find(|task| task.id == "task-a").unwrap();
+        assert_eq!(recovered.status, TaskStatus::Interrupted);
+        assert_eq!(recovered.interrupted_from.as_deref(), Some("IMPLEMENTING"));
+        // a task with a stable status is untouched
+        let untouched = tasks.iter().find(|task| task.id == "task-b").unwrap();
+        assert_eq!(untouched.status, TaskStatus::PlanReady);
+        assert!(untouched.interrupted_from.is_none());
+    }
+
+    #[test]
+    fn clears_the_interrupt_marker_on_resume() {
+        let connection = memory();
+        insert_task(&connection, &sample_task("task-a", TaskStatus::Implementing)).unwrap();
+        recover_interrupted(&connection).unwrap();
+        set_task_running_state(&connection, "task-a", TaskStatus::Approved, "t1").unwrap();
+        let task = get_task(&connection, "task-a").unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Approved);
+        assert!(task.interrupted_from.is_none());
+    }
+
+    #[test]
+    fn round_trips_opencode_servers() {
+        let connection = memory();
+        let server = OpencodeServer {
+            run_id: "run-1".to_string(),
+            task_id: "task-1".to_string(),
+            pid: 4242,
+            port: 5132,
+            password: "secret".to_string(),
+            started_at: "t0".to_string(),
+        };
+        record_opencode_server(&connection, &server).unwrap();
+        let servers = list_opencode_servers(&connection).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].pid, 4242);
+        assert_eq!(servers[0].port, 5132);
+        delete_opencode_server(&connection, "run-1").unwrap();
+        assert!(list_opencode_servers(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn app_state_load_marks_in_flight_tasks_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let connection = open(&temp.path().join("jira-agent.db")).unwrap();
+            insert_task(&connection, &sample_task("task-a", TaskStatus::Implementing)).unwrap();
+        }
+        let state = crate::state::AppState::load_with_key_source(
+            temp.path().to_path_buf(),
+            crate::secure_store::KeySource::File,
+        )
+        .unwrap();
+        let connection = state.db.lock().unwrap();
+        let task = get_task(&connection, "task-a").unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Interrupted);
+        assert_eq!(task.interrupted_from.as_deref(), Some("IMPLEMENTING"));
     }
 
     #[test]
@@ -1343,5 +2111,49 @@ mod tests {
         )
         .unwrap();
         assert!(repair_on_validation_failure(&connection));
+    }
+
+    #[test]
+    fn stores_lists_and_prunes_metrics() {
+        let connection = memory();
+        for index in 0..5 {
+            insert_metric(
+                &connection,
+                &Metric {
+                    id: format!("m-{index}"),
+                    name: "test.duration_ms".to_string(),
+                    value: index as f64,
+                    task_id: Some("task-1".to_string()),
+                    dims: serde_json::json!({ "attempt": index + 1 }),
+                    created_at: format!("2026-10-07T00:00:0{index}Z"),
+                },
+            )
+            .unwrap();
+        }
+        insert_metric(
+            &connection,
+            &Metric {
+                id: "m-other".to_string(),
+                name: "files.changed".to_string(),
+                value: 3.0,
+                task_id: None,
+                dims: serde_json::Value::Null,
+                created_at: "2026-10-07T00:01:00Z".to_string(),
+            },
+        )
+        .unwrap();
+
+        // Newest first, name-filtered.
+        let filtered = list_metrics(&connection, Some("test.duration_ms"), 10).unwrap();
+        assert_eq!(filtered.len(), 5);
+        assert_eq!(filtered[0].value, 4.0);
+        assert_eq!(filtered[0].dims["attempt"], 5);
+        assert_eq!(list_metrics(&connection, None, 10).unwrap().len(), 6);
+
+        // Pruning keeps only the newest rows.
+        prune_metrics(&connection, 2).unwrap();
+        let remaining = list_metrics(&connection, None, 10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].name, "files.changed");
     }
 }

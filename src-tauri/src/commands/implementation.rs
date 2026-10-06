@@ -25,11 +25,7 @@ fn slug_from_title(title: &str) -> String {
 }
 
 fn emit_task(app: &AppHandle, state: &AppState, task_id: &str) {
-    if let Ok(connection) = state.db.lock() {
-        if let Ok(Some(task)) = db::get_task(&connection, task_id) {
-            let _ = app.emit("task://updated", &task);
-        }
-    }
+    crate::commands::cloud_socket::emit_task_updated(app, state, task_id);
 }
 
 pub fn start_implementation_inner(
@@ -74,7 +70,12 @@ pub fn start_implementation_inner(
             Some(workspace) => workspace,
             None => {
                 let slug = slug_from_title(&task.title);
-                let workspace = manager.create(&repository, task_id, Some(&slug))?;
+                // An interrupted workspace creation can leave a worktree on
+                // disk without a row; adopt it instead of refusing to overwrite.
+                let workspace = match manager.adopt(&repository, task_id, Some(&slug)) {
+                    Some(workspace) => workspace,
+                    None => manager.create(&repository, task_id, Some(&slug))?,
+                };
                 let connection = state.db.lock().map_err(|error| error.to_string())?;
                 db::insert_workspace(&connection, &workspace)?;
                 workspace
@@ -147,6 +148,12 @@ pub fn start_implementation_inner(
         server,
     )?;
 
+    crate::logging::info(
+        "implementation",
+        "started",
+        serde_json::json!({ "taskId": task_id, "runId": run_id, "model": selected_model }),
+    );
+
     opencode::spawn_event_listener(
         app.clone(),
         run_id.clone(),
@@ -201,6 +208,11 @@ fn implementation_done(app: &AppHandle, task_id: &str) {
 }
 
 fn implementation_failed(app: &AppHandle, task_id: &str, error: &str) {
+    crate::logging::error(
+        "implementation",
+        "task failed",
+        serde_json::json!({ "taskId": task_id, "error": error }),
+    );
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(connection) = state.db.lock() {
             let _ = db::update_task_status(&connection, task_id, TaskStatus::Failed, &now());

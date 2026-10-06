@@ -8,9 +8,12 @@ import {
   FileCode,
   FolderOpen,
   GitBranch,
+  GitCommit,
+  GitPullRequest,
   Loader2,
   Play,
   RefreshCw,
+  RotateCcw,
   Terminal,
   XCircle,
 } from "lucide-react";
@@ -47,7 +50,11 @@ const POST_APPROVAL: TaskStatus[] = [
   "WAITING_FOR_REVIEW",
 ];
 
-function buildMilestones(task: AgentTask, events: AgentEvent[]): Milestone[] {
+function buildMilestones(
+  task: AgentTask,
+  events: AgentEvent[],
+  hasPullRequest: boolean,
+): Milestone[] {
   const has = (type: AgentEvent["type"]) => events.some((event) => event.type === type);
   const status = task.status;
 
@@ -65,8 +72,21 @@ function buildMilestones(task: AgentTask, events: AgentEvent[]): Milestone[] {
       done: status === "TESTING" || status === "VALIDATING" || has("test_result"),
     },
     { label: "Validation", done: has("finished") && status === "VALIDATING" },
-    { label: "Commit", done: status === "COMMITTING" || status === "PR_CREATING" },
-    { label: "Pull request", done: status === "PR_CREATED" || status === "WAITING_FOR_REVIEW" },
+    {
+      label: "Commit",
+      done:
+        task.commitHash != null ||
+        status === "PR_CREATING" ||
+        status === "PR_CREATED" ||
+        status === "WAITING_FOR_REVIEW",
+    },
+    {
+      label: "Pull request",
+      done:
+        hasPullRequest ||
+        status === "PR_CREATED" ||
+        status === "WAITING_FOR_REVIEW",
+    },
   ];
 
   const firstPending = raw.findIndex((item) => !item.done);
@@ -105,11 +125,27 @@ export function TaskRun() {
   const setRepairOnValidationFailure = useAppStore(
     (state) => state.setRepairOnValidationFailure,
   );
+  const commitChanges = useAppStore((state) => state.commitChanges);
+  const githubAccount = useAppStore((state) => state.githubAccount);
+  const pullRequests = useAppStore((state) => state.pullRequests);
+  const loadGithubAccount = useAppStore((state) => state.loadGithubAccount);
+  const createPullRequest = useAppStore((state) => state.createPullRequest);
+  const loadPullRequest = useAppStore((state) => state.loadPullRequest);
+  const jiraAccount = useAppStore((state) => state.jiraAccount);
+  const jiraSyncs = useAppStore((state) => state.jiraSyncs);
+  const loadJira = useAppStore((state) => state.loadJira);
+  const loadJiraSync = useAppStore((state) => state.loadJiraSync);
+  const syncTaskJira = useAppStore((state) => state.syncTaskJira);
   const initAgentListeners = useAppStore((state) => state.initAgentListeners);
+  const resumeTask = useAppStore((state) => state.resumeTask);
 
   const [refreshing, setRefreshing] = useState(false);
   const [testing, setTesting] = useState(false);
   const [validating, setValidating] = useState(false);
+  const [committing, setCommitting] = useState(false);
+  const [publishing, setPublishing] = useState(false);
+  const [jiraSyncing, setJiraSyncing] = useState(false);
+  const [resuming, setResuming] = useState(false);
 
   const task = tasks.find((item) => item.id === taskId);
   const repository = task
@@ -132,6 +168,16 @@ export function TaskRun() {
   const lastRun = runs[runs.length - 1];
   const validationList = validationRuns[taskId] ?? [];
   const lastValidation = validationList[validationList.length - 1];
+  const canCommit =
+    task?.status === "COMMITTING" ||
+    task?.status === "FAILED" ||
+    task?.status === "INTERRUPTED";
+  const pr = pullRequests[taskId];
+  const canPublish =
+    task?.status === "PR_CREATING" ||
+    task?.status === "FAILED" ||
+    task?.status === "INTERRUPTED";
+  const jiraSync = jiraSyncs[taskId];
   const finished = events.some((event) => event.type === "finished");
 
   useEffect(() => {
@@ -170,6 +216,26 @@ export function TaskRun() {
   useEffect(() => {
     void loadRepairOnValidationFailure();
   }, [loadRepairOnValidationFailure]);
+
+  useEffect(() => {
+    void loadGithubAccount();
+  }, [loadGithubAccount]);
+
+  useEffect(() => {
+    if (task) {
+      void loadPullRequest(taskId);
+    }
+  }, [task?.id, task?.status, loadPullRequest, taskId]);
+
+  useEffect(() => {
+    void loadJira();
+  }, [loadJira]);
+
+  useEffect(() => {
+    if (task) {
+      void loadJiraSync(taskId);
+    }
+  }, [task?.id, task?.status, loadJiraSync, taskId]);
 
   const commands = useMemo(
     () =>
@@ -212,11 +278,58 @@ export function TaskRun() {
     }
   }
 
+  async function handleCommit() {
+    setCommitting(true);
+    try {
+      await commitChanges(taskId);
+    } catch {
+      // Surfaced through the store.
+    } finally {
+      setCommitting(false);
+    }
+  }
+
+  async function handlePublish() {
+    setPublishing(true);
+    try {
+      await createPullRequest(taskId);
+    } catch {
+      // Surfaced through the store.
+    } finally {
+      setPublishing(false);
+    }
+  }
+
+  async function handleJiraSync() {
+    setJiraSyncing(true);
+    try {
+      await syncTaskJira(taskId);
+    } catch {
+      // Surfaced through the store.
+    } finally {
+      setJiraSyncing(false);
+    }
+  }
+
   async function handleToggleRepair(enabled: boolean) {
     try {
       await setRepairOnValidationFailure(enabled);
     } catch {
       // Surfaced through the store.
+    }
+  }
+
+  async function handleResume() {
+    if (!task) {
+      return;
+    }
+    setResuming(true);
+    try {
+      await resumeTask(task.id);
+    } catch {
+      // Surfaced through the store.
+    } finally {
+      setResuming(false);
     }
   }
 
@@ -237,7 +350,7 @@ export function TaskRun() {
     );
   }
 
-  const milestones = buildMilestones(task, events);
+  const milestones = buildMilestones(task, events, pr != null);
 
   return (
     <div className="flex flex-col">
@@ -265,6 +378,16 @@ export function TaskRun() {
           <Link to={`/tasks/${taskId}/diff`} className="text-primary">
             View diff →
           </Link>
+          {task.status === "INTERRUPTED" ? (
+            <Button onClick={handleResume} disabled={resuming}>
+              {resuming ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <RotateCcw className="size-4" />
+              )}
+              Resume interrupted run
+            </Button>
+          ) : null}
         </div>
 
         <div className="grid gap-4 lg:grid-cols-3">
@@ -534,6 +657,124 @@ export function TaskRun() {
                   Open workspace
                 </Button>
               </div>
+            ) : null}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardDescription>Git commit</CardDescription>
+            <CardTitle className="flex items-center justify-between">
+              Commit
+              <Button
+                onClick={handleCommit}
+                disabled={committing || !task.workspacePath || !canCommit}
+              >
+                {committing ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <GitCommit className="size-4" />
+                )}
+                {task.commitHash ? "Re-commit" : "Commit changes"}
+              </Button>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2 text-sm">
+            {task.commitHash ? (
+              <p className="font-mono text-xs">committed {task.commitHash}</p>
+            ) : (
+              <p className="text-muted-foreground">Not committed yet.</p>
+            )}
+            {!canCommit && !task.commitHash ? (
+              <p className="text-xs text-muted-foreground">
+                Available once validation passes (task reaches COMMITTING).
+              </p>
+            ) : null}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardDescription>Pull request</CardDescription>
+            <CardTitle className="flex items-center justify-between">
+              GitHub PR
+              <Button
+                onClick={handlePublish}
+                disabled={publishing || !task.workspacePath || !canPublish}
+              >
+                {publishing ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <GitPullRequest className="size-4" />
+                )}
+                {pr ? "Re-publish" : "Create PR"}
+              </Button>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2 text-sm">
+            {pr ? (
+              <a
+                href={pr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-primary"
+              >
+                PR #{pr.number} ({pr.status})
+              </a>
+            ) : (
+              <p className="text-muted-foreground">No pull request yet.</p>
+            )}
+            {!githubAccount ? (
+              <p className="text-xs text-muted-foreground">
+                Connect GitHub in Settings to publish.
+              </p>
+            ) : null}
+            {!canPublish && !pr ? (
+              <p className="text-xs text-muted-foreground">
+                Available once the task is PR_CREATING (after commit).
+              </p>
+            ) : null}
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardDescription>JIRA synchronization</CardDescription>
+            <CardTitle className="flex items-center justify-between">
+              {task.jiraIssueKey}
+              <Button
+                onClick={handleJiraSync}
+                disabled={jiraSyncing || !jiraAccount}
+              >
+                {jiraSyncing ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="size-4" />
+                )}
+                Sync to JIRA
+              </Button>
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-2 text-sm">
+            {jiraSync ? (
+              <>
+                <p className="text-xs text-muted-foreground">
+                  Last synced:{" "}
+                  {jiraSync.lastSyncedAt
+                    ? new Date(jiraSync.lastSyncedAt).toLocaleString()
+                    : "-"}
+                </p>
+                {jiraSync.lastAction ? (
+                  <p className="text-xs">{jiraSync.lastAction}</p>
+                ) : null}
+              </>
+            ) : (
+              <p className="text-muted-foreground">Not synced yet.</p>
+            )}
+            {!jiraAccount ? (
+              <p className="text-xs text-muted-foreground">
+                Connect JIRA in Settings to sync tickets.
+              </p>
             ) : null}
           </CardContent>
         </Card>

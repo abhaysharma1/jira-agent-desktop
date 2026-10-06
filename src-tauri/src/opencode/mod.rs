@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,6 +14,7 @@ use crate::domain::{AgentEvent, AgentRunStatus, TodoItem};
 use crate::state::AppState;
 
 pub mod models;
+pub mod orphans;
 
 pub const DEFAULT_COMMAND: &str = "opencode";
 
@@ -74,6 +76,20 @@ pub fn free_port() -> Result<u16, String> {
         .port();
     drop(listener);
     Ok(port)
+}
+
+/// Environment variables stripped before spawning `opencode serve`: this app's
+/// JIRA integration and the backend's database/JWT secrets. Provider keys
+/// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `NPM_TOKEN`, `AWS_*`, …) are
+/// deliberately preserved because that is often how OpenCode is authenticated.
+fn is_sensitive_env(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.starts_with("JIRA_")
+        || upper.contains("DATABASE_URL")
+        || matches!(
+            upper.as_str(),
+            "JWT_SECRET" | "GH_TOKEN" | "GITHUB_TOKEN" | "GITHUB_PAT" | "PUBLIC_BASE_URL"
+        )
 }
 
 pub fn resolve_program(command: &str) -> Result<PathBuf, String> {
@@ -288,11 +304,17 @@ pub struct ManagedServer {
     pub child: Child,
     pub base_url: String,
     pub password: String,
+    pub port: u16,
 }
 
 impl ManagedServer {
     pub fn client(&self) -> OpenCodeClient {
         OpenCodeClient::new(self.base_url.clone(), self.password.clone())
+    }
+
+    /// OS process id of the `opencode serve` child, for crash recovery.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn stop(&mut self, session_id: Option<&str>) {
@@ -325,6 +347,12 @@ pub fn start_server(
     let log = std::fs::File::create(&log_path).map_err(|error| error.to_string())?;
     let stderr = log.try_clone().map_err(|error| error.to_string())?;
 
+    // Never hand the agent this app's own credentials: pass the parent
+    // environment minus our integration and database secrets.
+    let scrubbed: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(key, _)| !is_sensitive_env(&key.to_string_lossy()))
+        .collect();
+
     let mut command = Command::new(program);
     command
         .args([
@@ -335,6 +363,8 @@ pub fn start_server(
             &port.to_string(),
         ])
         .current_dir(dir)
+        .env_clear()
+        .envs(scrubbed)
         .env("OPENCODE_SERVER_PASSWORD", &password)
         .env("OPENCODE_PERMISSION", permission)
         .env("OPENCODE_CONFIG_CONTENT", inline_config)
@@ -362,9 +392,16 @@ pub fn start_server(
             break;
         }
         if Instant::now() > deadline {
-            let _ = std::fs::read_to_string(&log_path).map(|contents| {
-                eprintln!("opencode server log:\n{contents}");
-            });
+            let contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+            crate::logging::error(
+                "opencode",
+                "server start timed out",
+                json!({
+                    "port": port,
+                    "log": log_path.to_string_lossy(),
+                    "output": contents,
+                }),
+            );
             return Err(
                 "timed out waiting for the opencode server to start; see ~/.jira-agent/logs"
                     .to_string(),
@@ -373,10 +410,18 @@ pub fn start_server(
         std::thread::sleep(Duration::from_millis(300));
     }
 
+    let pid = child.id();
+    crate::logging::info(
+        "opencode",
+        "server started",
+        json!({ "port": port, "pid": pid }),
+    );
+
     Ok(ManagedServer {
         child,
         base_url,
         password,
+        port,
     })
 }
 
@@ -989,6 +1034,7 @@ fn finalize(
     error: Option<String>,
 ) {
     let timestamp = now();
+    let error_message = error.unwrap_or_default();
     let event = if success {
         AgentEvent::Finished {
             run_id: run_id.to_string(),
@@ -997,7 +1043,7 @@ fn finalize(
     } else {
         AgentEvent::Failed {
             run_id: run_id.to_string(),
-            error: error.unwrap_or_default(),
+            error: error_message.clone(),
             timestamp: timestamp.clone(),
         }
     };
@@ -1020,6 +1066,24 @@ fn finalize(
         persist_run(app, run_id);
     }
 
+    // Phase 26: durations and failures are tracked centrally here, the single
+    // completion point for every agent run (planning, implementation, repair).
+    let finished_run = app.try_state::<AppState>().and_then(|state| {
+        state
+            .agents
+            .lock()
+            .ok()
+            .and_then(|agents| agents.get(run_id).map(|runtime| runtime.run.clone()))
+    });
+    if let Some(run) = finished_run {
+        crate::metrics::record_run(
+            app,
+            &run,
+            success,
+            (!success).then_some(error_message.as_str()),
+        );
+    }
+
     let _ = app.emit(AGENT_EVENT, &event);
     let status = if success {
         AgentRunStatus::Succeeded
@@ -1035,6 +1099,37 @@ fn finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrubs_sensitive_environment_variables() {
+        for key in [
+            "JIRA_CLIENT_ID",
+            "JIRA_CLIENT_SECRET",
+            "JWT_SECRET",
+            "DATABASE_URL",
+            "TEST_DATABASE_URL",
+            "PRISMA_DATABASE_URL",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_PAT",
+        ] {
+            assert!(is_sensitive_env(key), "{key} should be scrubbed");
+        }
+
+        // Provider/CI keys the user may rely on are kept.
+        for key in [
+            "PATH",
+            "HOME",
+            "USERPROFILE",
+            "SYSTEMROOT",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "NPM_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+        ] {
+            assert!(!is_sensitive_env(key), "{key} should be preserved");
+        }
+    }
 
     #[test]
     fn build_prompt_body_includes_agent_and_model() {

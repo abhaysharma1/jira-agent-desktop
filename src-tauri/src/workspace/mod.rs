@@ -64,6 +64,34 @@ impl WorkspaceManager {
         })
     }
 
+    /// Adopts a worktree left on disk by an interrupted workspace creation: if
+    /// the expected path exists and is checked out on the branch we would have
+    /// created, return a matching `Workspace` so resume can continue instead of
+    /// failing on "workspace path already exists".
+    pub fn adopt(
+        &self,
+        repository: &Repository,
+        task_id: &str,
+        slug: Option<&str>,
+    ) -> Option<Workspace> {
+        let path = self.workspace_path(task_id);
+        if !path.exists() {
+            return None;
+        }
+        let branch = branch_name(task_id, slug);
+        if git::current_branch(&path).as_deref() != Some(branch.as_str()) {
+            return None;
+        }
+        Some(Workspace {
+            id: Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            repository_id: repository.id.clone(),
+            path: path.to_string_lossy().replace('\\', "/"),
+            branch_name: branch,
+            created_at: Utc::now().to_rfc3339(),
+        })
+    }
+
     pub fn remove(&self, repository: &Repository, workspace: &Workspace) -> Result<(), String> {
         let repo_path = Path::new(&repository.local_path);
         let target = Path::new(&workspace.path);
@@ -215,5 +243,22 @@ mod tests {
         let repository = repository::detect(&repo_dir).unwrap();
         let manager = WorkspaceManager::new(temp.path().join("workspaces"));
         assert!(manager.create(&repository, "CC-1", None).is_err());
+    }
+
+    #[test]
+    fn adopts_a_leftover_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_dir = temp.path().join("repo");
+        fs::create_dir(&repo_dir).unwrap();
+        init_repo(&repo_dir);
+
+        let repository = repository::detect(&repo_dir).unwrap();
+        let manager = WorkspaceManager::new(temp.path().join("workspaces"));
+
+        assert!(manager.adopt(&repository, "CC-9", Some("t")).is_none());
+        let created = manager.create(&repository, "CC-9", Some("t")).unwrap();
+        let adopted = manager.adopt(&repository, "CC-9", Some("t")).unwrap();
+        assert_eq!(adopted.branch_name, created.branch_name);
+        assert_eq!(adopted.path, created.path);
     }
 }

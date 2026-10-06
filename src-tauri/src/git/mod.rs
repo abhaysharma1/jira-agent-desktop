@@ -128,6 +128,39 @@ pub fn branch_exists(repo: &Path, branch: &str) -> bool {
     rev_parse_verify(repo, &format!("refs/heads/{branch}"))
 }
 
+pub fn push_branch(repo: &Path, branch: &str) -> Result<(), String> {
+    run_git(repo, &["push", "-u", "origin", branch]).map(|_| ())
+}
+
+pub fn commit_all(path: &Path, message: &str) -> Result<String, String> {
+    run_git(path, &["add", "-A"])?;
+
+    if let Err(error) = run_git(path, &["commit", "-m", message]) {
+        let identity_missing = error.contains("Please tell me who you are")
+            || error.contains("unable to auto-detect email")
+            || error.contains("empty ident name")
+            || error.contains("Author identity unknown");
+        if identity_missing {
+            run_git(
+                path,
+                &[
+                    "-c",
+                    "user.name=JIRA Agent",
+                    "-c",
+                    "user.email=jira-agent@localhost",
+                    "commit",
+                    "-m",
+                    message,
+                ],
+            )?;
+        } else {
+            return Err(error);
+        }
+    }
+
+    run_git(path, &["rev-parse", "--short", "HEAD"])
+}
+
 pub fn worktree_stats(path: &Path) -> Result<DiffStats, String> {
     let mut files: Vec<FileStat> = Vec::new();
 
@@ -349,6 +382,28 @@ mod tests {
         assert_eq!(deleted.status, "deleted");
         assert!(deleted.modified.is_empty());
         assert!(deleted.original.contains("bye"));
+    }
+
+    #[test]
+    fn commits_all_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("repo");
+        fs::create_dir(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        let hash = commit_all(&dir, "CC-1: do the thing").unwrap();
+        assert!(!hash.is_empty());
+        let subject = run_git(&dir, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject, "CC-1: do the thing");
+        assert!(changed_files(&dir).unwrap().is_empty());
+
+        assert!(commit_all(&dir, "nothing").is_err());
     }
 }
 
