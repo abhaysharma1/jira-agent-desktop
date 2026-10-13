@@ -10,7 +10,13 @@ use crate::secure_store::SecureStore;
 use crate::state::AppState;
 
 /// Settings keys that hold credentials rather than ordinary configuration.
-pub const SECRET_KEYS: &[&str] = &["githubToken", "cloudToken", "cloudDeviceToken"];
+pub const SECRET_KEYS: &[&str] = &[
+    "githubToken",
+    "cloudToken",
+    "cloudDeviceToken",
+    "jiraClientId",
+    "jiraClientSecret",
+];
 
 pub fn is_envelope(value: &str) -> bool {
     value.starts_with("v1:")
@@ -67,9 +73,10 @@ pub fn migrate_plaintext(state: &AppState) -> Result<(), String> {
     let connection = state.db.lock().map_err(|error| error.to_string())?;
 
     for key in SECRET_KEYS {
-        let current = db::get_setting(&connection, key)
-            .and_then(|value| value.as_str().map(str::to_string));
-        if let Some(value) = current.filter(|value| !value.trim().is_empty() && !is_envelope(value)) {
+        let current =
+            db::get_setting(&connection, key).and_then(|value| value.as_str().map(str::to_string));
+        if let Some(value) = current.filter(|value| !value.trim().is_empty() && !is_envelope(value))
+        {
             let envelope = state.secure_store.encrypt(&value)?;
             db::set_setting(&connection, key, &Value::String(envelope))?;
         }
@@ -92,7 +99,8 @@ mod tests {
 
     fn state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let state = AppState::load_with_key_source(dir.path().to_path_buf(), KeySource::File).unwrap();
+        let state =
+            AppState::load_with_key_source(dir.path().to_path_buf(), KeySource::File).unwrap();
         (state, dir)
     }
 
@@ -100,7 +108,10 @@ mod tests {
     fn round_trips_secret_settings() {
         let (state, _dir) = state();
         set(&state, "githubToken", "ghp_example").unwrap();
-        assert_eq!(get(&state, "githubToken").unwrap().as_deref(), Some("ghp_example"));
+        assert_eq!(
+            get(&state, "githubToken").unwrap().as_deref(),
+            Some("ghp_example")
+        );
 
         // the raw value on disk is an envelope, not the token
         let connection = state.db.lock().unwrap();
@@ -113,9 +124,17 @@ mod tests {
         let (state, _dir) = state();
         {
             let connection = state.db.lock().unwrap();
-            db::set_setting(&connection, "cloudToken", &Value::String("legacy".to_string())).unwrap();
+            db::set_setting(
+                &connection,
+                "cloudToken",
+                &Value::String("legacy".to_string()),
+            )
+            .unwrap();
         }
-        assert_eq!(get(&state, "cloudToken").unwrap().as_deref(), Some("legacy"));
+        assert_eq!(
+            get(&state, "cloudToken").unwrap().as_deref(),
+            Some("legacy")
+        );
     }
 
     #[test]

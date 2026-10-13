@@ -91,7 +91,9 @@ pub fn find_model<'a>(models: &'a [ModelInfo], id: &str) -> Option<&'a ModelInfo
 
 #[allow(dead_code)]
 pub fn is_free(models: &[ModelInfo], id: &str) -> bool {
-    find_model(models, id).map(|model| model.free).unwrap_or(false)
+    find_model(models, id)
+        .map(|model| model.free)
+        .unwrap_or(false)
 }
 
 pub fn inline_config(default_model: &str) -> String {

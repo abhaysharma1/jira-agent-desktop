@@ -34,7 +34,7 @@ pub fn start_implementation_inner(
     task_id: &str,
     model: Option<String>,
 ) -> Result<(), String> {
-    let (task, repository, plan_content) = {
+    let (task, repository, plan_content, planning_model) = {
         let connection = state.db.lock().map_err(|error| error.to_string())?;
         let task = db::get_task(&connection, task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
@@ -51,7 +51,10 @@ pub fn start_implementation_inner(
             .ok_or_else(|| "task has no approved plan version".to_string())?;
         let plan_version = db::get_plan_version(&connection, task_id, version_number)?
             .ok_or_else(|| format!("approved plan version {version_number} not found"))?;
-        (task, repository, plan_version.content)
+        // Reuse the model the user selected while planning unless the caller
+        // passed an explicit override.
+        let planning_model = db::latest_run_model(&connection, task_id, "planning")?;
+        (task, repository, plan_version.content, planning_model)
     };
 
     {
@@ -106,7 +109,8 @@ pub fn start_implementation_inner(
     let log_dir = state.data_dir.join("logs");
     let selected_model = model
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| opencode::models::DEFAULT_MODEL.to_string());
+        .or_else(|| planning_model.filter(|value| !value.trim().is_empty()))
+        .unwrap_or_else(|| super::settings::resolve_default_model(state));
     let config = opencode::models::inline_config(&selected_model);
     let session_title = format!("Implement {}", task.jira_issue_key);
     let dir_for_thread = dir.clone();
@@ -215,7 +219,7 @@ fn implementation_failed(app: &AppHandle, task_id: &str, error: &str) {
     );
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(connection) = state.db.lock() {
-            let _ = db::update_task_status(&connection, task_id, TaskStatus::Failed, &now());
+            let _ = db::mark_task_failed(&connection, task_id, error, &now());
         }
         emit_task(app, &state, task_id);
     }

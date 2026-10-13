@@ -42,6 +42,8 @@ pub fn register_run(
                 cost,
                 model,
                 server,
+                failure_handler: std::sync::Arc::new(crate::opencode::PromptCallbacks::default()),
+                last_activity: std::time::Instant::now(),
             },
         );
     Ok(())

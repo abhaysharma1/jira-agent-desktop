@@ -7,10 +7,11 @@ use serde::Serialize;
 use crate::domain::{
     AgentEvent, AgentRun, AgentTask, JiraProjectRepo, JiraSync, Metric, OpencodeServer, Plan,
     PlanApproval, PlanContent, PlanMessage, PlanVersion, PullRequest, Repository, SearchHit,
-    TaskStatus, TestRun, ValidationConfig, ValidationResult, ValidationRun, Workspace,
+    TaskStatus, TestRun, TicketSource, ValidationConfig, ValidationResult, ValidationRun,
+    Workspace,
 };
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 10;
 
 pub fn open(path: &Path) -> Result<Connection, String> {
     let connection = Connection::open(path).map_err(|error| error.to_string())?;
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     jira_issue_key TEXT NOT NULL,
+    ticket_source TEXT NOT NULL DEFAULT 'jira',
     title TEXT NOT NULL,
     description TEXT NOT NULL,
     repository_id TEXT NOT NULL,
@@ -64,6 +66,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     branch_name TEXT,
     commit_hash TEXT,
     interrupted_from TEXT,
+    failure_reason TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -231,6 +234,23 @@ CREATE INDEX IF NOT EXISTS idx_metrics_name ON metrics(name, created_at);
             .map_err(|error| error.to_string())?;
     }
 
+    if !column_exists(&connection, "tasks", "failure_reason")? {
+        connection
+            .execute("ALTER TABLE tasks ADD COLUMN failure_reason TEXT", [])
+            .map_err(|error| error.to_string())?;
+    }
+
+    // Tasks can be started without a JIRA ticket ("custom" tasks). Existing
+    // rows are all JIRA-backed.
+    if !column_exists(&connection, "tasks", "ticket_source")? {
+        connection
+            .execute(
+                "ALTER TABLE tasks ADD COLUMN ticket_source TEXT NOT NULL DEFAULT 'jira'",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+    }
+
     connection
         .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
         .map_err(|error| error.to_string())?;
@@ -287,7 +307,12 @@ pub fn import_json_if_empty(connection: &Connection, data_dir: &Path) -> Result<
     import_table::<AgentTask>(connection, "tasks", data_dir, "tasks.json")?;
     import_table::<Plan>(connection, "plans", data_dir, "plans.json")?;
     import_table::<PlanVersion>(connection, "plan_versions", data_dir, "plan_versions.json")?;
-    import_table::<PlanApproval>(connection, "plan_approvals", data_dir, "plan_approvals.json")?;
+    import_table::<PlanApproval>(
+        connection,
+        "plan_approvals",
+        data_dir,
+        "plan_approvals.json",
+    )?;
     import_table::<PlanMessage>(connection, "plan_messages", data_dir, "plan_messages.json")?;
     Ok(())
 }
@@ -299,7 +324,9 @@ fn import_table<T: DeserializeOwned + Importable>(
     file: &str,
 ) -> Result<(), String> {
     let count: i64 = connection
-        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
         .map_err(|error| error.to_string())?;
     if count > 0 {
         return Ok(());
@@ -483,7 +510,10 @@ pub fn get_workspace_by_task(
 
 pub fn remove_workspace_by_task(connection: &Connection, task_id: &str) -> Result<(), String> {
     connection
-        .execute("DELETE FROM workspaces WHERE task_id = ?1", params![task_id])
+        .execute(
+            "DELETE FROM workspaces WHERE task_id = ?1",
+            params![task_id],
+        )
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -502,8 +532,8 @@ pub fn insert_task(connection: &Connection, task: &AgentTask) -> Result<(), Stri
             "INSERT OR REPLACE INTO tasks
              (id, jira_issue_key, title, description, repository_id, status, plan_version,
               approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
-              created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              failure_reason, created_at, updated_at, ticket_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 task.id,
                 task.jira_issue_key,
@@ -517,8 +547,10 @@ pub fn insert_task(connection: &Connection, task: &AgentTask) -> Result<(), Stri
                 task.branch_name,
                 task.commit_hash,
                 task.interrupted_from,
+                task.failure_reason,
                 task.created_at,
                 task.updated_at,
+                enum_to_string(&task.ticket_source),
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -527,9 +559,12 @@ pub fn insert_task(connection: &Connection, task: &AgentTask) -> Result<(), Stri
 
 fn row_to_task(row: &Row) -> rusqlite::Result<AgentTask> {
     let status: String = row.get(5)?;
+    let source: String = row.get(15)?;
     Ok(AgentTask {
         id: row.get(0)?,
         jira_issue_key: row.get(1)?,
+        ticket_source: enum_from_str::<TicketSource>(&source)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
         title: row.get(2)?,
         description: row.get(3)?,
         repository_id: row.get(4)?,
@@ -540,8 +575,9 @@ fn row_to_task(row: &Row) -> rusqlite::Result<AgentTask> {
         branch_name: row.get(9)?,
         commit_hash: row.get(10)?,
         interrupted_from: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        failure_reason: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -550,7 +586,7 @@ pub fn list_tasks(connection: &Connection) -> Result<Vec<AgentTask>, String> {
         .prepare(
             "SELECT id, jira_issue_key, title, description, repository_id, status, plan_version,
                     approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
-                    created_at, updated_at
+                    failure_reason, created_at, updated_at, ticket_source
              FROM tasks ORDER BY created_at DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -566,7 +602,7 @@ pub fn get_task(connection: &Connection, id: &str) -> Result<Option<AgentTask>, 
         .query_row(
             "SELECT id, jira_issue_key, title, description, repository_id, status, plan_version,
                     approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
-                    created_at, updated_at
+                    failure_reason, created_at, updated_at, ticket_source
              FROM tasks WHERE id = ?1",
             params![id],
             row_to_task,
@@ -590,7 +626,27 @@ pub fn update_task_status(
     Ok(())
 }
 
-/// Moves a task to `status` and clears the crash marker. Used by resume.
+/// Marks a task failed, recording the stage it was in (`interrupted_from`) and
+/// the reason. The stage is only recorded once, so a repeat failure does not
+/// overwrite the original. Retry clears both via `set_task_running_state`.
+pub fn mark_task_failed(
+    connection: &Connection,
+    task_id: &str,
+    reason: &str,
+    updated_at: &str,
+) -> Result<(), String> {
+    connection
+        .execute(
+            "UPDATE tasks
+             SET interrupted_from = status, status = 'FAILED', failure_reason = ?2, updated_at = ?3
+             WHERE id = ?1 AND status <> 'FAILED'",
+            params![task_id, reason, updated_at],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+/// Moves a task to `status` and clears the crash/failure markers. Used by resume.
 pub fn set_task_running_state(
     connection: &Connection,
     task_id: &str,
@@ -599,7 +655,7 @@ pub fn set_task_running_state(
 ) -> Result<(), String> {
     connection
         .execute(
-            "UPDATE tasks SET status = ?1, interrupted_from = NULL, updated_at = ?2 WHERE id = ?3",
+            "UPDATE tasks SET status = ?1, interrupted_from = NULL, failure_reason = NULL, updated_at = ?2 WHERE id = ?3",
             params![enum_to_string(&status), updated_at, task_id],
         )
         .map_err(|error| error.to_string())?;
@@ -664,10 +720,7 @@ impl Importable for PlanVersion {
     }
 }
 
-pub fn insert_plan_version(
-    connection: &Connection,
-    version: &PlanVersion,
-) -> Result<(), String> {
+pub fn insert_plan_version(connection: &Connection, version: &PlanVersion) -> Result<(), String> {
     connection
         .execute(
             "INSERT OR REPLACE INTO plan_versions
@@ -914,7 +967,7 @@ pub fn approve_plan(
         .query_row(
             "SELECT id, jira_issue_key, title, description, repository_id, status, plan_version,
                     approved_plan_version, workspace_path, branch_name, commit_hash, interrupted_from,
-                    created_at, updated_at
+                    failure_reason, created_at, updated_at, ticket_source
              FROM tasks WHERE id = ?1",
             params![task_id],
             row_to_task,
@@ -978,8 +1031,8 @@ pub fn reject_plan(
     task_id: &str,
     timestamp: &str,
 ) -> Result<AgentTask, String> {
-    let task = get_task(connection, task_id)?
-        .ok_or_else(|| format!("task not found: {task_id}"))?;
+    let task =
+        get_task(connection, task_id)?.ok_or_else(|| format!("task not found: {task_id}"))?;
 
     if !task.status.can_transition_to(TaskStatus::Rejected) {
         return Err(format!(
@@ -1000,10 +1053,7 @@ impl Importable for PlanMessage {
     }
 }
 
-pub fn insert_plan_message(
-    connection: &Connection,
-    message: &PlanMessage,
-) -> Result<(), String> {
+pub fn insert_plan_message(connection: &Connection, message: &PlanMessage) -> Result<(), String> {
     connection
         .execute(
             "INSERT OR REPLACE INTO plan_messages (id, task_id, role, content, created_at, plan_version)
@@ -1079,6 +1129,29 @@ pub fn upsert_agent_run(
         )
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// The model used by the most recent run of `mode` for a task, if any. Letting
+/// implementation look this up means it (and, transitively, repair) reuse the
+/// model the user picked while planning instead of silently falling back to the
+/// default.
+pub fn latest_run_model(
+    connection: &Connection,
+    task_id: &str,
+    mode: &str,
+) -> Result<Option<String>, String> {
+    connection
+        .query_row(
+            "SELECT model FROM agent_runs
+             WHERE task_id = ?1 AND mode = ?2
+               AND model IS NOT NULL AND TRIM(model) <> ''
+             ORDER BY started_at DESC
+             LIMIT 1",
+            params![task_id, mode],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())
 }
 
 pub fn insert_agent_event(
@@ -1197,10 +1270,7 @@ pub fn list_test_runs(connection: &Connection, task_id: &str) -> Result<Vec<Test
         .map_err(|error| error.to_string())
 }
 
-pub fn insert_validation_run(
-    connection: &Connection,
-    run: &ValidationRun,
-) -> Result<(), String> {
+pub fn insert_validation_run(connection: &Connection, run: &ValidationRun) -> Result<(), String> {
     connection
         .execute(
             "INSERT OR REPLACE INTO validation_runs (id, task_id, passed, results_json, created_at)
@@ -1270,12 +1340,8 @@ pub fn upsert_jira_project_repo(
         )
         .optional()
         .map_err(|error| error.to_string())?;
-    let (id, created_at) = existing.unwrap_or_else(|| {
-        (
-            uuid::Uuid::new_v4().to_string(),
-            timestamp.clone(),
-        )
-    });
+    let (id, created_at) =
+        existing.unwrap_or_else(|| (uuid::Uuid::new_v4().to_string(), timestamp.clone()));
     connection
         .execute(
             "INSERT OR REPLACE INTO jira_project_repos
@@ -1367,6 +1433,31 @@ pub fn close_to_tray(connection: &Connection) -> bool {
         .unwrap_or(true)
 }
 
+/// The user's theme preference: `"light"`, `"dark"`, or `"system"`. Defaults
+/// to `"system"` so the app follows the OS until the user chooses otherwise.
+/// Unknown or corrupt values fall back to `"system"`.
+pub fn theme(connection: &Connection) -> String {
+    get_setting(connection, "theme")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .filter(|value| is_valid_theme(value))
+        .unwrap_or_else(|| "system".to_string())
+}
+
+/// Whether `theme` is one of the values the app understands.
+pub fn is_valid_theme(theme: &str) -> bool {
+    matches!(theme, "light" | "dark" | "system")
+}
+
+/// The user's preferred default OpenCode model (a `provider/model` id).
+/// `None` means "use the built-in default" (`opencode::models::DEFAULT_MODEL`),
+/// which also covers empty or corrupt stored values.
+pub fn default_model(connection: &Connection) -> Option<String> {
+    get_setting(connection, "defaultModel")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 // ------------------------------------------------------------ opencode servers
 
 pub fn record_opencode_server(
@@ -1436,7 +1527,10 @@ pub fn list_opencode_servers(connection: &Connection) -> Result<Vec<OpencodeServ
         .map_err(|error| error.to_string())
 }
 
-pub fn insert_pull_request(connection: &Connection, pull_request: &PullRequest) -> Result<(), String> {
+pub fn insert_pull_request(
+    connection: &Connection,
+    pull_request: &PullRequest,
+) -> Result<(), String> {
     connection
         .execute(
             "INSERT OR REPLACE INTO pull_requests
@@ -1635,10 +1729,7 @@ pub fn search(
                     .unwrap_or_else(|_| content.chars().take(60).collect());
                 Ok(SearchHit {
                     kind: "plan".to_string(),
-                    title: format!(
-                        "{}: {summary}",
-                        key.unwrap_or_else(|| "Plan".to_string())
-                    ),
+                    title: format!("{}: {summary}", key.unwrap_or_else(|| "Plan".to_string())),
                     subtitle: format!("Plan v{version}"),
                     route: format!("/tasks/{task_id}"),
                     task_id,
@@ -1802,6 +1893,7 @@ mod tests {
         AgentTask {
             id: id.to_string(),
             jira_issue_key: "CC-1".to_string(),
+            ticket_source: TicketSource::Jira,
             title: "t".to_string(),
             description: "d".to_string(),
             repository_id: "repo-1".to_string(),
@@ -1812,6 +1904,7 @@ mod tests {
             branch_name: None,
             commit_hash: None,
             interrupted_from: None,
+            failure_reason: None,
             created_at: "t0".to_string(),
             updated_at: "t0".to_string(),
         }
@@ -1830,6 +1923,52 @@ mod tests {
             tests: vec!["t".to_string()],
             risks: vec![],
         }
+    }
+
+    #[test]
+    fn latest_run_model_returns_the_most_recent_match() {
+        let connection = memory();
+        let run = |id: &str, mode: &str, model: Option<&str>, started: &str| {
+            upsert_agent_run(
+                &connection,
+                &crate::domain::AgentRun {
+                    id: id.to_string(),
+                    task_id: "task-1".to_string(),
+                    mode: mode.to_string(),
+                    agent: None,
+                    status: crate::domain::AgentRunStatus::Succeeded,
+                    session_id: None,
+                    started_at: started.to_string(),
+                    completed_at: None,
+                },
+                "",
+                0.0,
+                model,
+            )
+            .unwrap();
+        };
+        run("a", "planning", Some("deepseek/deepseek-flash"), "t1");
+        run("b", "planning", Some("anthropic/claude"), "t2");
+        run("c", "implementation", Some("opencode/free"), "t3");
+        run("d", "planning", None, "t4");
+
+        // Most recent planning model wins; empty models and other modes are ignored.
+        assert_eq!(
+            latest_run_model(&connection, "task-1", "planning")
+                .unwrap()
+                .as_deref(),
+            Some("anthropic/claude")
+        );
+        assert_eq!(
+            latest_run_model(&connection, "task-1", "implementation")
+                .unwrap()
+                .as_deref(),
+            Some("opencode/free")
+        );
+        assert_eq!(
+            latest_run_model(&connection, "task-1", "repair").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1914,6 +2053,36 @@ mod tests {
     }
 
     #[test]
+    fn theme_defaults_to_system_and_persists() {
+        let connection = memory();
+        assert_eq!(theme(&connection), "system");
+        set_setting(&connection, "theme", &serde_json::json!("dark")).unwrap();
+        assert_eq!(theme(&connection), "dark");
+        // Unknown values fall back to the default.
+        set_setting(&connection, "theme", &serde_json::json!("sepia")).unwrap();
+        assert_eq!(theme(&connection), "system");
+    }
+
+    #[test]
+    fn default_model_round_trips_and_clears() {
+        let connection = memory();
+        assert_eq!(default_model(&connection), None);
+        set_setting(
+            &connection,
+            "defaultModel",
+            &serde_json::json!("opencode/big-pickle"),
+        )
+        .unwrap();
+        assert_eq!(
+            default_model(&connection),
+            Some("opencode/big-pickle".to_string())
+        );
+        // Whitespace-only values are treated as unset.
+        set_setting(&connection, "defaultModel", &serde_json::json!("  ")).unwrap();
+        assert_eq!(default_model(&connection), None);
+    }
+
+    #[test]
     fn stores_and_reads_repository() {
         let connection = memory();
         let repository = Repository {
@@ -1927,9 +2096,52 @@ mod tests {
         };
         insert_repository(&connection, &repository).unwrap();
         assert_eq!(list_repositories(&connection).unwrap().len(), 1);
-        assert_eq!(get_repository(&connection, "repo-1").unwrap().unwrap().name, "demo");
+        assert_eq!(
+            get_repository(&connection, "repo-1").unwrap().unwrap().name,
+            "demo"
+        );
         remove_repository(&connection, "repo-1").unwrap();
         assert!(list_repositories(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn round_trips_ticket_source_and_migrates_old_rows() {
+        let connection = memory();
+        let mut task = sample_task("task-custom", TaskStatus::Planning);
+        task.ticket_source = TicketSource::Custom;
+        insert_task(&connection, &task).unwrap();
+        assert_eq!(
+            get_task(&connection, "task-custom")
+                .unwrap()
+                .unwrap()
+                .ticket_source,
+            TicketSource::Custom
+        );
+
+        // A pre-v10 database has no `ticket_source` column; migration adds it
+        // with a 'jira' default so existing rows stay JIRA-backed.
+        let old = Connection::open_in_memory().unwrap();
+        old.execute_batch(
+            "CREATE TABLE tasks (
+                 id TEXT PRIMARY KEY, jira_issue_key TEXT NOT NULL, title TEXT NOT NULL,
+                 description TEXT NOT NULL, repository_id TEXT NOT NULL, status TEXT NOT NULL,
+                 plan_version INTEGER, approved_plan_version INTEGER, workspace_path TEXT,
+                 branch_name TEXT, commit_hash TEXT, interrupted_from TEXT, failure_reason TEXT,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        old.execute(
+            "INSERT INTO tasks
+                 (id, jira_issue_key, title, description, repository_id, status, created_at, updated_at)
+             VALUES ('old', 'CC-1', 't', 'd', 'r', 'PLANNING', 't0', 't0')",
+            [],
+        )
+        .unwrap();
+        migrate(&old).unwrap();
+        assert_eq!(
+            get_task(&old, "old").unwrap().unwrap().ticket_source,
+            TicketSource::Jira
+        );
     }
 
     #[test]
@@ -1945,9 +2157,21 @@ mod tests {
         let (_, v2) =
             store_plan_version(&connection, "task-1", sample_content(), "agent", "t2").unwrap();
         assert_eq!(v2.version, 2);
-        assert_eq!(latest_plan_version(&connection, "task-1").unwrap().unwrap().version, 2);
+        assert_eq!(
+            latest_plan_version(&connection, "task-1")
+                .unwrap()
+                .unwrap()
+                .version,
+            2
+        );
         assert_eq!(list_plan_versions(&connection, "task-1").unwrap().len(), 2);
-        assert_eq!(get_task(&connection, "task-1").unwrap().unwrap().plan_version, Some(2));
+        assert_eq!(
+            get_task(&connection, "task-1")
+                .unwrap()
+                .unwrap()
+                .plan_version,
+            Some(2)
+        );
     }
 
     #[test]
@@ -1958,9 +2182,23 @@ mod tests {
 
         let approval = approve_plan(&connection, "task-1", None, "local-user", "t2").unwrap();
         assert_eq!(approval.plan_version, 1);
-        assert_eq!(get_task(&connection, "task-1").unwrap().unwrap().status, TaskStatus::Approved);
-        assert!(get_plan_version(&connection, "task-1", 1).unwrap().unwrap().approved);
-        assert_eq!(latest_plan_approval(&connection, "task-1").unwrap().unwrap().user_id, "local-user");
+        assert_eq!(
+            get_task(&connection, "task-1").unwrap().unwrap().status,
+            TaskStatus::Approved
+        );
+        assert!(
+            get_plan_version(&connection, "task-1", 1)
+                .unwrap()
+                .unwrap()
+                .approved
+        );
+        assert_eq!(
+            latest_plan_approval(&connection, "task-1")
+                .unwrap()
+                .unwrap()
+                .user_id,
+            "local-user"
+        );
     }
 
     #[test]
@@ -1974,7 +2212,11 @@ mod tests {
     #[test]
     fn recovers_interrupted_runs() {
         let connection = memory();
-        insert_task(&connection, &sample_task("task-a", TaskStatus::Implementing)).unwrap();
+        insert_task(
+            &connection,
+            &sample_task("task-a", TaskStatus::Implementing),
+        )
+        .unwrap();
         insert_task(&connection, &sample_task("task-b", TaskStatus::PlanReady)).unwrap();
         recover_interrupted(&connection).unwrap();
         let tasks = list_tasks(&connection).unwrap();
@@ -1990,12 +2232,46 @@ mod tests {
     #[test]
     fn clears_the_interrupt_marker_on_resume() {
         let connection = memory();
-        insert_task(&connection, &sample_task("task-a", TaskStatus::Implementing)).unwrap();
+        insert_task(
+            &connection,
+            &sample_task("task-a", TaskStatus::Implementing),
+        )
+        .unwrap();
         recover_interrupted(&connection).unwrap();
         set_task_running_state(&connection, "task-a", TaskStatus::Approved, "t1").unwrap();
         let task = get_task(&connection, "task-a").unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Approved);
         assert!(task.interrupted_from.is_none());
+        assert!(task.failure_reason.is_none());
+    }
+
+    #[test]
+    fn records_failed_stage_and_reason() {
+        let connection = memory();
+        insert_task(
+            &connection,
+            &sample_task("task-a", TaskStatus::Implementing),
+        )
+        .unwrap();
+
+        mark_task_failed(&connection, "task-a", "boom", "t1").unwrap();
+        let task = get_task(&connection, "task-a").unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.interrupted_from.as_deref(), Some("IMPLEMENTING"));
+        assert_eq!(task.failure_reason.as_deref(), Some("boom"));
+
+        // a repeat failure keeps the original stage, refreshing only the reason
+        mark_task_failed(&connection, "task-a", "boom again", "t2").unwrap();
+        let task = get_task(&connection, "task-a").unwrap().unwrap();
+        assert_eq!(task.interrupted_from.as_deref(), Some("IMPLEMENTING"));
+        assert_eq!(task.failure_reason.as_deref(), Some("boom"));
+
+        // retry clears both markers
+        set_task_running_state(&connection, "task-a", TaskStatus::Approved, "t3").unwrap();
+        let task = get_task(&connection, "task-a").unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Approved);
+        assert!(task.interrupted_from.is_none());
+        assert!(task.failure_reason.is_none());
     }
 
     #[test]
@@ -2022,8 +2298,12 @@ mod tests {
     fn app_state_load_marks_in_flight_tasks_interrupted() {
         let temp = tempfile::tempdir().unwrap();
         {
-            let connection = open(&temp.path().join("jira-agent.db")).unwrap();
-            insert_task(&connection, &sample_task("task-a", TaskStatus::Implementing)).unwrap();
+            let connection = open(&temp.path().join("ticketbridge.db")).unwrap();
+            insert_task(
+                &connection,
+                &sample_task("task-a", TaskStatus::Implementing),
+            )
+            .unwrap();
         }
         let state = crate::state::AppState::load_with_key_source(
             temp.path().to_path_buf(),
@@ -2039,7 +2319,11 @@ mod tests {
     #[test]
     fn stores_workspace_on_task() {
         let connection = memory();
-        insert_task(&connection, &sample_task("task-1", TaskStatus::Implementing)).unwrap();
+        insert_task(
+            &connection,
+            &sample_task("task-1", TaskStatus::Implementing),
+        )
+        .unwrap();
         set_task_workspace(&connection, "task-1", "C:/ws/CC-1", "agent/CC-1", "t1").unwrap();
         let task = get_task(&connection, "task-1").unwrap().unwrap();
         assert_eq!(task.workspace_path.as_deref(), Some("C:/ws/CC-1"));
@@ -2056,10 +2340,16 @@ mod tests {
         };
         set_validation_config(&connection, "repo-1", &config).unwrap();
         assert_eq!(
-            get_validation_config(&connection, "repo-1").unwrap().test.as_deref(),
+            get_validation_config(&connection, "repo-1")
+                .unwrap()
+                .test
+                .as_deref(),
             Some("npm test")
         );
-        assert_eq!(get_validation_config(&connection, "missing").unwrap().test, None);
+        assert_eq!(
+            get_validation_config(&connection, "missing").unwrap().test,
+            None
+        );
         assert_eq!(max_repair_attempts(&connection), 5);
 
         insert_task(&connection, &sample_task("task-1", TaskStatus::Testing)).unwrap();

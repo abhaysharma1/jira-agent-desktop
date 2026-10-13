@@ -10,6 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { TitleBar } from "@/components/layout/TitleBar";
 import {
   NotificationBell,
   TicketNotificationCards,
@@ -110,70 +111,68 @@ export function AppLayout() {
   const interrupted = tasks.filter((task) => task.status === "INTERRUPTED");
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
-      <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
-        <div className="flex h-14 items-center border-b px-4">
-          <span className="text-sm font-semibold tracking-tight">
-            JIRA Agent
-          </span>
-        </div>
-        <nav className="flex flex-1 flex-col gap-1 p-2">
-          {navItems.map(({ to, label, icon: Icon, end }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={end}
-              className={({ isActive }) =>
-                cn(
-                  "flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors",
-                  isActive
-                    ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                    : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-                )
-              }
-            >
-              <Icon className="size-4" />
-              {label}
-            </NavLink>
-          ))}
-        </nav>
-        <div className="border-t p-3 text-xs text-muted-foreground">
-          Local MVP
-        </div>
-      </aside>
-      <main className="flex flex-1 flex-col overflow-hidden">
-        <header className="flex h-14 shrink-0 items-center justify-end gap-3 border-b px-4">
-          <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <span className={cn("size-2 rounded-full", status.className)} />
-            {status.label}
-          </span>
-          <NotificationBell />
-        </header>
-        {interrupted.length > 0 && !dismissedRecovery ? (
-          <div className="flex shrink-0 items-center gap-3 border-b bg-amber-500/10 px-4 py-2 text-sm text-amber-700">
-            <AlertTriangle className="size-4 shrink-0" />
-            <span>
-              {interrupted.length} task
-              {interrupted.length === 1 ? " was" : "s were"} interrupted by a
-              previous shutdown.
-            </span>
-            <Link to="/tasks" className="font-medium underline">
-              Review and resume
-            </Link>
-            <button
-              type="button"
-              onClick={() => setDismissedRecovery(true)}
-              className="ml-auto text-muted-foreground"
-              aria-label="Dismiss recovery notice"
-            >
-              <X className="size-4" />
-            </button>
+    <div className="flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
+      <TitleBar />
+      <div className="flex flex-1 overflow-hidden">
+        <aside className="flex w-56 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
+          <nav className="flex flex-1 flex-col gap-1 p-2">
+            {navItems.map(({ to, label, icon: Icon, end }) => (
+              <NavLink
+                key={to}
+                to={to}
+                end={end}
+                className={({ isActive }) =>
+                  cn(
+                    "flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+                    isActive
+                      ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                      : "text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                  )
+                }
+              >
+                <Icon className="size-4" />
+                {label}
+              </NavLink>
+            ))}
+          </nav>
+          <div className="border-t p-3 text-xs text-muted-foreground">
+            Local MVP
           </div>
-        ) : null}
-        <div className="flex-1 overflow-auto">
-          <Outlet />
-        </div>
-      </main>
+        </aside>
+        <main className="flex flex-1 flex-col overflow-hidden">
+          <header className="flex h-14 shrink-0 items-center justify-end gap-3 border-b px-4">
+            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <span className={cn("size-2 rounded-full", status.className)} />
+              {status.label}
+            </span>
+            <NotificationBell />
+          </header>
+          {interrupted.length > 0 && !dismissedRecovery ? (
+            <div className="flex shrink-0 items-center gap-3 border-b bg-amber-500/10 px-4 py-2 text-sm text-amber-700">
+              <AlertTriangle className="size-4 shrink-0" />
+              <span>
+                {interrupted.length} task
+                {interrupted.length === 1 ? " was" : "s were"} interrupted by a
+                previous shutdown.
+              </span>
+              <Link to="/tasks" className="font-medium underline">
+                Review and resume
+              </Link>
+              <button
+                type="button"
+                onClick={() => setDismissedRecovery(true)}
+                className="ml-auto text-muted-foreground"
+                aria-label="Dismiss recovery notice"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+          ) : null}
+          <div className="flex-1 overflow-auto">
+            <Outlet />
+          </div>
+        </main>
+      </div>
       <TicketNotificationCards />
       <CommandPalette />
     </div>

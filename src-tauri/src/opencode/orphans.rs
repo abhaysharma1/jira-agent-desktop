@@ -132,6 +132,8 @@ mod tests {
         let killed = sweep(&state).unwrap();
         assert_eq!(killed, 0);
         let connection = state.db.lock().unwrap();
-        assert!(crate::db::list_opencode_servers(&connection).unwrap().is_empty());
+        assert!(crate::db::list_opencode_servers(&connection)
+            .unwrap()
+            .is_empty());
     }
 }

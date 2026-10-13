@@ -28,17 +28,15 @@ pub fn list_repositories(state: State<AppState>) -> Result<Vec<Repository>, Stri
 }
 
 #[tauri::command]
-pub fn add_repository(
-    state: State<AppState>,
-    local_path: String,
-) -> Result<Repository, String> {
+pub fn add_repository(state: State<AppState>, local_path: String) -> Result<Repository, String> {
     let repository = repository::detect(Path::new(&local_path))?;
     let connection = state.db.lock().map_err(|error| error.to_string())?;
 
-    if db::list_repositories(&connection)?
-        .iter()
-        .any(|existing| existing.local_path.eq_ignore_ascii_case(&repository.local_path))
-    {
+    if db::list_repositories(&connection)?.iter().any(|existing| {
+        existing
+            .local_path
+            .eq_ignore_ascii_case(&repository.local_path)
+    }) {
         return Err(format!("{} is already registered", repository.name));
     }
 
@@ -58,10 +56,7 @@ pub fn get_repository_status(
 }
 
 #[tauri::command]
-pub fn remove_repository(
-    state: State<AppState>,
-    repository_id: String,
-) -> Result<(), String> {
+pub fn remove_repository(state: State<AppState>, repository_id: String) -> Result<(), String> {
     let connection = state.db.lock().map_err(|error| error.to_string())?;
     db::remove_repository(&connection, &repository_id)
 }

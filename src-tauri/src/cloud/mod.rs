@@ -33,7 +33,7 @@ impl CloudClient {
             return Err("cloud base URL is required".to_string());
         }
         let http = reqwest::blocking::Client::builder()
-            .user_agent("jira-agent-desktop")
+            .user_agent("ticketbridge-desktop")
             .build()
             .map_err(|error| error.to_string())?;
         Ok(Self { base_url, http })
@@ -224,7 +224,10 @@ mod tests {
 
     #[test]
     fn normalizes_base_urls() {
-        assert_eq!(normalize_base_url("api.example.com"), "https://api.example.com");
+        assert_eq!(
+            normalize_base_url("api.example.com"),
+            "https://api.example.com"
+        );
         assert_eq!(
             normalize_base_url("https://api.example.com/"),
             "https://api.example.com"
@@ -237,7 +240,8 @@ mod tests {
 
     #[test]
     fn lists_and_reads_notifications() {
-        let server = MockServer::start(|request, _body| match request {
+        let server = MockServer::start(|request, _body| {
+            match request {
             "GET /notifications?after=2026-01-01T00%3A00%3A00Z" => (
                 200,
                 r#"{"notifications":[{"id":"n1","type":"jira:issue_created","title":"CC-1: Add pagination","createdAt":"2026-01-02T00:00:00Z"}]}"#
@@ -253,6 +257,7 @@ mod tests {
                 r#"{"notification":{"id":"n1","readAt":"2026-01-03T00:00:00Z"}}"#.to_string(),
             ),
             _ => (404, r#"{"error":"unexpected"}"#.to_string()),
+        }
         });
 
         let client = CloudClient::new(server.base_url()).unwrap();
@@ -265,9 +270,7 @@ mod tests {
             .unwrap();
         assert_eq!(items.len(), 1);
 
-        let updated = client
-            .mark_notification_read("device-token", "n1")
-            .unwrap();
+        let updated = client.mark_notification_read("device-token", "n1").unwrap();
         assert_eq!(updated["readAt"], "2026-01-03T00:00:00Z");
     }
 

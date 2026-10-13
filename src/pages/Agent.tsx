@@ -49,6 +49,7 @@ export function Agent() {
   const agentCost = useAppStore((state) => state.agentCost);
   const agentModel = useAppStore((state) => state.agentModel);
   const models = useAppStore((state) => state.models);
+  const defaultModel = useAppStore((state) => state.defaultModel);
   const activeRunId = useAppStore((state) => state.activeRunId);
   const error = useAppStore((state) => state.error);
   const loadRepositories = useAppStore((state) => state.loadRepositories);
@@ -61,9 +62,13 @@ export function Agent() {
 
   const [targetDir, setTargetDir] = useState("");
   const [agent, setAgent] = useState("plan");
-  const [model, setModel] = useState(DEFAULT_MODEL);
+  const [model, setModel] = useState(defaultModel ?? DEFAULT_MODEL);
   const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
   const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setModel(defaultModel ?? DEFAULT_MODEL);
+  }, [defaultModel]);
 
   useEffect(() => {
     void initAgentListeners();

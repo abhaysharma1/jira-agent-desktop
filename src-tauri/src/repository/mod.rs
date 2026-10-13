@@ -17,10 +17,7 @@ pub fn detect(local_path: &Path) -> Result<Repository, String> {
         return Err(format!("path is not a directory: {}", canonical.display()));
     }
     if !git::is_git_repository(&canonical) {
-        return Err(format!(
-            "{} is not a git repository",
-            canonical.display()
-        ));
+        return Err(format!("{} is not a git repository", canonical.display()));
     }
     let root = git::toplevel(&canonical)?;
     let local_path = root.to_string_lossy().replace('\\', "/");
@@ -94,11 +91,11 @@ mod tests {
         let root = temp.path().join("remote-repo");
         fs::create_dir(&root).unwrap();
         init_repo(&root);
-        git(&root, &["remote", "add", "origin", "https://example.com/foo.git"]);
         git(
             &root,
-            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &["remote", "add", "origin", "https://example.com/foo.git"],
         );
+        git(&root, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(
             &root,
             &[

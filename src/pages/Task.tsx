@@ -21,9 +21,11 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { PageHeader } from "@/components/layout/PageHeader";
+import { TicketCombobox } from "@/components/jira/TicketCombobox";
 import { useAppStore } from "@/stores/appStore";
 import { api } from "@/api/tauri";
-import type { AgentTask, TaskStatus } from "@/types";
+import { isCustomTask, taskLabel } from "@/types";
+import type { AgentTask, JiraIssue, TaskStatus } from "@/types";
 
 const DEFAULT_MODEL = "opencode/nemotron-3-ultra-free";
 
@@ -75,17 +77,21 @@ export function Task() {
   const ticketParam = searchParams.get("ticket");
   const repositories = useAppStore((state) => state.repositories);
   const models = useAppStore((state) => state.models);
+  const defaultModel = useAppStore((state) => state.defaultModel);
   const tasks = useAppStore((state) => state.tasks);
   const activeTask = useAppStore((state) => state.activeTask);
   const planVersions = useAppStore((state) => state.planVersions);
   const workspaces = useAppStore((state) => state.workspaces);
   const workspaceStatuses = useAppStore((state) => state.workspaceStatuses);
+  const jiraConnection = useAppStore((state) => state.jiraConnection);
+  const jiraProjectRepos = useAppStore((state) => state.jiraProjectRepos);
   const error = useAppStore((state) => state.error);
 
   const loadRepositories = useAppStore((state) => state.loadRepositories);
   const loadModels = useAppStore((state) => state.loadModels);
   const loadTasks = useAppStore((state) => state.loadTasks);
   const loadPlan = useAppStore((state) => state.loadPlan);
+  const loadJira = useAppStore((state) => state.loadJira);
   const startPlanning = useAppStore((state) => state.startPlanning);
   const setActiveTask = useAppStore((state) => state.setActiveTask);
   const loadWorkspaces = useAppStore((state) => state.loadWorkspaces);
@@ -95,12 +101,14 @@ export function Task() {
     (state) => state.refreshWorkspaceStatus,
   );
 
+  const [mode, setMode] = useState<"jira" | "custom">("jira");
   const [repositoryId, setRepositoryId] = useState("");
-  const [key, setKey] = useState("CC-142");
+  const [key, setKey] = useState("");
+  const [selectedTicket, setSelectedTicket] = useState<JiraIssue | null>(null);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [acceptance, setAcceptance] = useState("");
-  const [model, setModel] = useState(DEFAULT_MODEL);
+  const [model, setModel] = useState(defaultModel ?? DEFAULT_MODEL);
   const [planning, setPlanning] = useState(false);
   const [taskTab, setTaskTab] = useState<"active" | "history">(
     searchParams.get("tab") === "history" ? "history" : "active",
@@ -116,7 +124,12 @@ export function Task() {
     void loadModels();
     void loadTasks();
     void loadWorkspaces();
-  }, [loadRepositories, loadModels, loadTasks, loadWorkspaces]);
+    void loadJira();
+  }, [loadRepositories, loadModels, loadTasks, loadWorkspaces, loadJira]);
+
+  useEffect(() => {
+    setModel(defaultModel ?? DEFAULT_MODEL);
+  }, [defaultModel]);
 
   useEffect(() => {
     if (!repositoryId && repositories.length > 0) {
@@ -143,12 +156,12 @@ export function Task() {
     if (!ticketParam) {
       return;
     }
+    setMode("jira");
     setKey(ticketParam);
     void api
       .getJiraIssue(ticketParam)
       .then((issue) => {
-        setTitle(issue.summary);
-        setDescription(issue.description);
+        handleSelectTicket(issue);
       })
       .catch(() => {
         // The ticket could not be loaded; the user can still fill it in.
@@ -157,19 +170,37 @@ export function Task() {
 
   const activePlan = activeTask ? planVersions[activeTask.id] : undefined;
 
+  function handleSelectTicket(issue: JiraIssue) {
+    setSelectedTicket(issue);
+    setKey(issue.key);
+    setTitle(issue.summary);
+    setDescription(issue.description);
+    const projectKey = issue.key.split("-")[0];
+    const mapping = jiraProjectRepos.find(
+      (repo) => repo.projectKey === projectKey,
+    );
+    if (mapping) {
+      setRepositoryId(mapping.repositoryId);
+    }
+  }
+
   async function handleCreatePlan() {
-    if (!repositoryId || !key.trim() || !title.trim()) {
+    if (!repositoryId || !title.trim()) {
+      return;
+    }
+    if (mode === "jira" && !key.trim()) {
       return;
     }
     setPlanning(true);
     try {
       await startPlanning(
         repositoryId,
-        key.trim(),
+        mode === "custom" ? key.trim() || undefined : key.trim(),
         title.trim(),
         description.trim(),
         acceptance.trim() || undefined,
         model || undefined,
+        mode,
       );
     } catch {
       // Surfaced through the store.
@@ -213,7 +244,11 @@ export function Task() {
         }`}
       >
         <TaskStatusBadge status={task.status} />
-        <span className="font-mono text-xs">{task.jiraIssueKey}</span>
+        {isCustomTask(task) ? (
+          <Badge variant="outline">Custom</Badge>
+        ) : (
+          <span className="font-mono text-xs">{task.jiraIssueKey}</span>
+        )}
         <span className="truncate">{task.title}</span>
       </button>
     );
@@ -223,7 +258,7 @@ export function Task() {
     <div className="flex flex-col">
       <PageHeader
         title="Task"
-        description="A single JIRA ticket moving through the workflow."
+        description="Start a task from a JIRA ticket or from scratch."
       />
       <div className="flex flex-col gap-4 p-6">
         <Card>
@@ -235,6 +270,30 @@ export function Task() {
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
+            <div className="inline-flex w-fit rounded-lg border border-input p-0.5">
+              <Button
+                variant={mode === "jira" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => {
+                  setMode("jira");
+                  setKey("");
+                  setSelectedTicket(null);
+                }}
+              >
+                JIRA ticket
+              </Button>
+              <Button
+                variant={mode === "custom" ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => {
+                  setMode("custom");
+                  setKey("");
+                  setSelectedTicket(null);
+                }}
+              >
+                Custom
+              </Button>
+            </div>
             <div className="flex flex-wrap gap-2">
               <label className="flex flex-1 flex-col gap-1 text-xs text-muted-foreground">
                 Repository
@@ -254,15 +313,31 @@ export function Task() {
                   )}
                 </select>
               </label>
-              <label className="flex flex-col gap-1 text-xs text-muted-foreground">
-                Ticket key
-                <input
-                  className="h-8 w-32 rounded-lg border border-input bg-background px-2 text-sm text-foreground"
-                  value={key}
-                  onChange={(event) => setKey(event.target.value)}
-                  placeholder="CC-142"
-                />
-              </label>
+              {mode === "jira" ? (
+                <div className="flex flex-[2] flex-col gap-1 text-xs text-muted-foreground">
+                  Ticket
+                  {jiraConnection ? (
+                    <TicketCombobox
+                      search={(query) => api.searchJiraIssues(query)}
+                      onSelect={handleSelectTicket}
+                    />
+                  ) : (
+                    <p className="flex h-8 items-center rounded-lg border border-dashed border-input px-2 text-xs">
+                      Connect JIRA in Settings to pick a ticket.
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+                  Ticket id (optional)
+                  <input
+                    className="h-8 w-40 rounded-lg border border-input bg-background px-2 text-sm text-foreground"
+                    value={key}
+                    onChange={(event) => setKey(event.target.value)}
+                    placeholder="Auto-generated"
+                  />
+                </label>
+              )}
               <label className="flex flex-[2] flex-col gap-1 text-xs text-muted-foreground">
                 Model
                 <select
@@ -282,6 +357,13 @@ export function Task() {
                 </select>
               </label>
             </div>
+            {mode === "jira" && selectedTicket ? (
+              <p className="text-xs text-muted-foreground">
+                Selected{" "}
+                <span className="font-mono">{selectedTicket.key}</span> —{" "}
+                {selectedTicket.summary}
+              </p>
+            ) : null}
             <label className="flex flex-col gap-1 text-xs text-muted-foreground">
               Title
               <input
@@ -313,7 +395,10 @@ export function Task() {
               <Button
                 onClick={handleCreatePlan}
                 disabled={
-                  planning || !repositoryId || !key.trim() || !title.trim()
+                  planning ||
+                  !repositoryId ||
+                  !title.trim() ||
+                  (mode === "jira" && !key.trim())
                 }
               >
                 <Sparkles className="size-4" />
@@ -389,7 +474,7 @@ export function Task() {
           <Card>
             <CardHeader>
               <CardDescription>
-                {activeTask ? activeTask.jiraIssueKey : "No active task"}
+                {activeTask ? taskLabel(activeTask) : "No active task"}
               </CardDescription>
               <CardTitle className="flex items-center gap-2">
                 <ClipboardList className="size-4" />
@@ -491,7 +576,7 @@ export function Task() {
               <p className="text-sm text-muted-foreground">
                 No workspaces yet. Creating one adds a git worktree under{" "}
                 <span className="font-mono text-xs">
-                  ~/.jira-agent/workspaces/
+                  ~/.ticketbridge/workspaces/
                 </span>
                 .
               </p>

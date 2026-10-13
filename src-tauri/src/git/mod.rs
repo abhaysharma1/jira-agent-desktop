@@ -101,12 +101,7 @@ pub fn changed_files(path: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-pub fn worktree_add(
-    repo: &Path,
-    target: &Path,
-    branch: &str,
-    base: &str,
-) -> Result<(), String> {
+pub fn worktree_add(repo: &Path, target: &Path, branch: &str, base: &str) -> Result<(), String> {
     let target = target.to_string_lossy().to_string();
     run_git(repo, &["worktree", "add", "-b", branch, &target, base]).map(|_| ())
 }
@@ -132,6 +127,32 @@ pub fn push_branch(repo: &Path, branch: &str) -> Result<(), String> {
     run_git(repo, &["push", "-u", "origin", branch]).map(|_| ())
 }
 
+pub fn is_clean(repo: &Path) -> bool {
+    changed_files(repo)
+        .map(|files| files.is_empty())
+        .unwrap_or(false)
+}
+
+pub fn checkout_branch(repo: &Path, branch: &str) -> Result<(), String> {
+    run_git(repo, &["checkout", branch]).map(|_| ())
+}
+
+/// Merges `branch` into the currently checked-out branch with a merge commit.
+/// On failure (e.g. conflicts) the merge is aborted so the working tree is left
+/// as it was before the attempt.
+pub fn merge_branch(repo: &Path, branch: &str, message: &str) -> Result<(), String> {
+    match run_git(
+        repo,
+        &["merge", "--no-ff", "--no-edit", "-m", message, branch],
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let _ = run_git_allow_fail(repo, &["merge", "--abort"]);
+            Err(error)
+        }
+    }
+}
+
 pub fn commit_all(path: &Path, message: &str) -> Result<String, String> {
     run_git(path, &["add", "-A"])?;
 
@@ -145,9 +166,9 @@ pub fn commit_all(path: &Path, message: &str) -> Result<String, String> {
                 path,
                 &[
                     "-c",
-                    "user.name=JIRA Agent",
+                    "user.name=TicketBridge",
                     "-c",
-                    "user.email=jira-agent@localhost",
+                    "user.email=ticketbridge@localhost",
                     "commit",
                     "-m",
                     message,
@@ -329,8 +350,14 @@ mod tests {
 
         let stats = worktree_stats(&dir).unwrap();
         assert_eq!(stats.files_changed, 2);
-        assert!(stats.files.iter().any(|f| f.path == "tracked.txt" && f.additions == 1));
-        assert!(stats.files.iter().any(|f| f.path == "new.txt" && f.status == "added"));
+        assert!(stats
+            .files
+            .iter()
+            .any(|f| f.path == "tracked.txt" && f.additions == 1));
+        assert!(stats
+            .files
+            .iter()
+            .any(|f| f.path == "new.txt" && f.status == "added"));
         assert!(stats.additions >= 4);
     }
 
@@ -405,5 +432,55 @@ mod tests {
 
         assert!(commit_all(&dir, "nothing").is_err());
     }
-}
 
+    #[test]
+    fn merges_branch_into_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("repo");
+        fs::create_dir(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        git(&dir, &["checkout", "-q", "-b", "agent/1"]);
+        fs::write(dir.join("b.txt"), "two\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "work"]);
+        git(&dir, &["checkout", "-q", "main"]);
+
+        assert!(is_clean(&dir));
+        merge_branch(&dir, "agent/1", "TB-1: work").unwrap();
+        assert!(dir.join("b.txt").exists());
+        let subject = run_git(&dir, &["log", "-1", "--format=%s"]).unwrap();
+        assert_eq!(subject, "TB-1: work");
+    }
+
+    #[test]
+    fn aborts_conflicting_merge_and_leaves_tree_clean() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("repo");
+        fs::create_dir(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        fs::write(dir.join("a.txt"), "base\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init"]);
+
+        git(&dir, &["checkout", "-q", "-b", "agent/1"]);
+        fs::write(dir.join("a.txt"), "branch\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "branch change"]);
+        git(&dir, &["checkout", "-q", "main"]);
+        fs::write(dir.join("a.txt"), "main\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "main change"]);
+
+        assert!(merge_branch(&dir, "agent/1", "TB-1: work").is_err());
+        assert!(!dir.join(".git").join("MERGE_HEAD").exists());
+        assert!(is_clean(&dir));
+    }
+}

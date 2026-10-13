@@ -30,6 +30,7 @@ import type {
   RepositoryStatus,
   SearchHit,
   TestRun,
+  ThemePreference,
   TicketIntake,
   ValidationConfig,
   ValidationRun,
@@ -76,11 +77,18 @@ export const api = {
     }),
   getPullRequest: (taskId: string) =>
     invoke<PullRequest | null>("get_pull_request", { taskId }),
+  mergeLocally: (taskId: string) =>
+    invoke<void>("merge_locally", { taskId }),
   setGithubToken: (token?: string) =>
     invoke<void>("set_github_token", { token: token ?? null }),
   getGithubAccount: () => invoke<string | null>("get_github_account"),
 
   startJiraOAuth: () => invoke<JiraConnectionInfo>("start_jira_oauth"),
+  isJiraOAuthConfigured: () => invoke<boolean>("jira_oauth_configured"),
+  setJiraOAuthCredentials: (clientId: string, clientSecret: string) =>
+    invoke<void>("set_jira_oauth_credentials", { clientId, clientSecret }),
+  clearJiraOAuthCredentials: () =>
+    invoke<void>("clear_jira_oauth_credentials"),
   getJiraConnectionInfo: () =>
     invoke<JiraConnectionInfo | null>("get_jira_connection_info"),
   registerJiraWebhook: () =>
@@ -131,6 +139,11 @@ export const api = {
     invoke<void>("set_jira_status_map", { map }),
   getJiraIssue: (key: string) =>
     invoke<JiraIssue>("get_jira_issue", { key }),
+  searchJiraIssues: (query?: string, limit?: number) =>
+    invoke<JiraIssue[]>("search_jira_issues", {
+      query: query ?? null,
+      limit: limit ?? null,
+    }),
   listJiraTransitions: (key: string) =>
     invoke<JiraTransition[]>("list_jira_transitions", { key }),
   getJiraSync: (taskId: string) =>
@@ -176,19 +189,21 @@ export const api = {
 
   startPlanning: (
     repositoryId: string,
-    key: string,
+    key: string | undefined,
     title: string,
     description: string,
     acceptanceCriteria?: string,
     model?: string,
+    ticketSource?: "jira" | "custom",
   ) =>
     invoke<AgentTask>("start_planning", {
       repositoryId,
-      key,
+      key: key ?? null,
       title,
       description,
       acceptanceCriteria: acceptanceCriteria ?? null,
       model: model ?? null,
+      ticketSource: ticketSource ?? null,
     }),
   listTasks: () => invoke<AgentTask[]>("list_tasks"),
   getTask: (taskId: string) => invoke<AgentTask>("get_task", { taskId }),
@@ -203,6 +218,13 @@ export const api = {
   getCloseToTray: () => invoke<boolean>("get_close_to_tray"),
   setCloseToTray: (enabled: boolean) =>
     invoke<void>("set_close_to_tray", { enabled }),
+
+  getTheme: () => invoke<ThemePreference>("get_theme"),
+  setTheme: (theme: ThemePreference) => invoke<void>("set_theme", { theme }),
+
+  getDefaultModel: () => invoke<string | null>("get_default_model"),
+  setDefaultModel: (model: string | null) =>
+    invoke<void>("set_default_model", { model }),
 
   listMetrics: (name?: string, limit?: number) =>
     invoke<Metric[]>("list_metrics", {

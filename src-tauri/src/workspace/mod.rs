@@ -35,10 +35,7 @@ impl WorkspaceManager {
 
         let repo_path = Path::new(&repository.local_path);
         if !git::is_git_repository(repo_path) {
-            return Err(format!(
-                "{} is not a git repository",
-                repository.local_path
-            ));
+            return Err(format!("{} is not a git repository", repository.local_path));
         }
 
         let path = self.workspace_path(task_id);
@@ -217,15 +214,24 @@ mod tests {
         let manager = WorkspaceManager::new(temp.path().join("workspaces"));
 
         let workspace = manager
-            .create(&repository, "CC-142", Some("Add pagination to Problems API"))
+            .create(
+                &repository,
+                "CC-142",
+                Some("Add pagination to Problems API"),
+            )
             .unwrap();
 
-        assert_eq!(workspace.branch_name, "agent/CC-142-add-pagination-to-problems-api");
+        assert_eq!(
+            workspace.branch_name,
+            "agent/CC-142-add-pagination-to-problems-api"
+        );
         assert!(Path::new(&workspace.path).exists());
         assert!(git::branch_exists(&repo_dir, &workspace.branch_name));
 
         fs::write(Path::new(&workspace.path).join("feature.txt"), "x").unwrap();
-        assert!(!git::changed_files(Path::new(&workspace.path)).unwrap().is_empty());
+        assert!(!git::changed_files(Path::new(&workspace.path))
+            .unwrap()
+            .is_empty());
         assert!(git::changed_files(&repo_dir).unwrap().is_empty());
 
         manager.remove(&repository, &workspace).unwrap();

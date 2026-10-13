@@ -15,6 +15,7 @@ import {
 import { api } from "@/api/tauri";
 import { useAppStore } from "@/stores/appStore";
 import { cn } from "@/lib/utils";
+import { taskLabel } from "@/types";
 import type { SearchHit, SearchKind } from "@/types";
 
 const SEARCH_DEBOUNCE_MS = 200;
@@ -144,7 +145,7 @@ export function CommandPalette() {
       },
       ...tasks.slice(0, 25).map<PaletteItem>((task) => ({
         id: `task-${task.id}`,
-        label: `Open ${task.jiraIssueKey}`,
+        label: `Open ${taskLabel(task)}`,
         hint: task.title,
         group: "Tickets",
         icon: ClipboardList,

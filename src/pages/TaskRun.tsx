@@ -9,6 +9,7 @@ import {
   FolderOpen,
   GitBranch,
   GitCommit,
+  GitMerge,
   GitPullRequest,
   Loader2,
   Play,
@@ -29,6 +30,7 @@ import {
 import { AgentTimeline } from "@/components/agent/AgentTimeline";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { useAppStore } from "@/stores/appStore";
+import { isCustomTask, isTerminal, taskLabel } from "@/types";
 import type { AgentEvent, AgentTask, TaskStatus } from "@/types";
 
 interface Milestone {
@@ -50,10 +52,29 @@ const POST_APPROVAL: TaskStatus[] = [
   "WAITING_FOR_REVIEW",
 ];
 
+// Statuses that only occur after the test phase has completed. A milestone is
+// ticked when the task has moved *past* its phase, not when the phase starts,
+// so the spinner always reflects the work actually in progress.
+const AFTER_TESTING: TaskStatus[] = [
+  "VALIDATING",
+  "COMMITTING",
+  "PR_CREATING",
+  "PR_CREATED",
+  "WAITING_FOR_REVIEW",
+];
+
+const AFTER_VALIDATION: TaskStatus[] = [
+  "COMMITTING",
+  "PR_CREATING",
+  "PR_CREATED",
+  "WAITING_FOR_REVIEW",
+];
+
 function buildMilestones(
   task: AgentTask,
   events: AgentEvent[],
   hasPullRequest: boolean,
+  localOnly: boolean,
 ): Milestone[] {
   const has = (type: AgentEvent["type"]) => events.some((event) => event.type === type);
   const status = task.status;
@@ -66,12 +87,16 @@ function buildMilestones(
     { label: "Workspace created", done: task.workspacePath != null },
     { label: "Branch created", done: task.branchName != null },
     { label: "Repository analyzed", done: has("file_read") || has("tool") },
-    { label: "Files modified", done: has("file_changed") },
     {
-      label: "Running tests",
-      done: status === "TESTING" || status === "VALIDATING" || has("test_result"),
+      label: "Files modified",
+      done:
+        AFTER_TESTING.includes(status) ||
+        (has("file_changed") &&
+          status !== "IMPLEMENTING" &&
+          status !== "REPAIRING"),
     },
-    { label: "Validation", done: has("finished") && status === "VALIDATING" },
+    { label: "Running tests", done: AFTER_TESTING.includes(status) },
+    { label: "Validation", done: AFTER_VALIDATION.includes(status) },
     {
       label: "Commit",
       done:
@@ -81,19 +106,21 @@ function buildMilestones(
         status === "WAITING_FOR_REVIEW",
     },
     {
-      label: "Pull request",
+      label: localOnly ? "Local merge" : "Pull request",
       done:
-        hasPullRequest ||
-        status === "PR_CREATED" ||
-        status === "WAITING_FOR_REVIEW",
+        status === "WAITING_FOR_REVIEW" ||
+        (!localOnly && (hasPullRequest || status === "PR_CREATED")),
     },
   ];
 
+  // A failed/interrupted/closed task has no work in progress, so don't animate
+  // a step as if it were still running.
+  const settled = isTerminal(status) || status === "INTERRUPTED";
   const firstPending = raw.findIndex((item) => !item.done);
   return raw.map((item, index) => ({
     label: item.label,
     done: item.done,
-    active: !item.done && index === firstPending,
+    active: !settled && !item.done && index === firstPending,
   }));
 }
 
@@ -130,6 +157,7 @@ export function TaskRun() {
   const pullRequests = useAppStore((state) => state.pullRequests);
   const loadGithubAccount = useAppStore((state) => state.loadGithubAccount);
   const createPullRequest = useAppStore((state) => state.createPullRequest);
+  const mergeLocally = useAppStore((state) => state.mergeLocally);
   const loadPullRequest = useAppStore((state) => state.loadPullRequest);
   const jiraAccount = useAppStore((state) => state.jiraAccount);
   const jiraSyncs = useAppStore((state) => state.jiraSyncs);
@@ -144,6 +172,7 @@ export function TaskRun() {
   const [validating, setValidating] = useState(false);
   const [committing, setCommitting] = useState(false);
   const [publishing, setPublishing] = useState(false);
+  const [merging, setMerging] = useState(false);
   const [jiraSyncing, setJiraSyncing] = useState(false);
   const [resuming, setResuming] = useState(false);
 
@@ -173,8 +202,13 @@ export function TaskRun() {
     task?.status === "FAILED" ||
     task?.status === "INTERRUPTED";
   const pr = pullRequests[taskId];
+  const repoHasOrigin = !!repository?.remoteUrl?.trim();
   const canPublish =
     task?.status === "PR_CREATING" ||
+    task?.status === "FAILED" ||
+    task?.status === "INTERRUPTED";
+  const canMerge =
+    task?.status === "PR_CREATED" ||
     task?.status === "FAILED" ||
     task?.status === "INTERRUPTED";
   const jiraSync = jiraSyncs[taskId];
@@ -232,7 +266,7 @@ export function TaskRun() {
   }, [loadJira]);
 
   useEffect(() => {
-    if (task) {
+    if (task && !isCustomTask(task)) {
       void loadJiraSync(taskId);
     }
   }, [task?.id, task?.status, loadJiraSync, taskId]);
@@ -300,6 +334,17 @@ export function TaskRun() {
     }
   }
 
+  async function handleMerge() {
+    setMerging(true);
+    try {
+      await mergeLocally(taskId);
+    } catch {
+      // Surfaced through the store.
+    } finally {
+      setMerging(false);
+    }
+  }
+
   async function handleJiraSync() {
     setJiraSyncing(true);
     try {
@@ -350,12 +395,12 @@ export function TaskRun() {
     );
   }
 
-  const milestones = buildMilestones(task, events, pr != null);
+  const milestones = buildMilestones(task, events, pr != null, !repoHasOrigin);
 
   return (
     <div className="flex flex-col">
       <PageHeader
-        title={`${task.jiraIssueKey} - ${task.title}`}
+        title={taskLabel(task)}
         description={repository ? repository.name : task.repositoryId}
       />
       <div className="flex flex-col gap-4 p-6">
@@ -378,15 +423,23 @@ export function TaskRun() {
           <Link to={`/tasks/${taskId}/diff`} className="text-primary">
             View diff →
           </Link>
-          {task.status === "INTERRUPTED" ? (
+          {task.status === "INTERRUPTED" || task.status === "FAILED" ? (
             <Button onClick={handleResume} disabled={resuming}>
               {resuming ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
                 <RotateCcw className="size-4" />
               )}
-              Resume interrupted run
+              {task.status === "FAILED"
+                ? "Retry failed run"
+                : "Resume interrupted run"}
             </Button>
+          ) : null}
+          {task.status === "FAILED" && task.failureReason ? (
+            <span className="flex items-center gap-1 text-xs text-destructive">
+              <AlertTriangle className="size-3.5" />
+              {task.failureReason}
+            </span>
           ) : null}
         </div>
 
@@ -693,55 +746,99 @@ export function TaskRun() {
           </CardContent>
         </Card>
 
+        {repoHasOrigin ? (
+          <Card>
+            <CardHeader>
+              <CardDescription>Pull request</CardDescription>
+              <CardTitle className="flex items-center justify-between">
+                GitHub PR
+                <Button
+                  onClick={handlePublish}
+                  disabled={publishing || !task.workspacePath || !canPublish}
+                >
+                  {publishing ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <GitPullRequest className="size-4" />
+                  )}
+                  {pr ? "Re-publish" : "Create PR"}
+                </Button>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="flex flex-col gap-2 text-sm">
+              {pr ? (
+                <a
+                  href={pr.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-primary"
+                >
+                  PR #{pr.number} ({pr.status})
+                </a>
+              ) : (
+                <p className="text-muted-foreground">No pull request yet.</p>
+              )}
+              {!githubAccount ? (
+                <p className="text-xs text-muted-foreground">
+                  Connect GitHub in Settings to publish.
+                </p>
+              ) : null}
+              {!canPublish && !pr ? (
+                <p className="text-xs text-muted-foreground">
+                  Available once the task is PR_CREATING (after commit).
+                </p>
+              ) : null}
+            </CardContent>
+          </Card>
+        ) : null}
+
         <Card>
           <CardHeader>
-            <CardDescription>Pull request</CardDescription>
-            <CardTitle className="flex items-center justify-between">
-              GitHub PR
+            <CardDescription>Local merge</CardDescription>
+            <CardTitle className="flex items-center justify-between gap-2">
+              Merge into{" "}
+              <span className="font-mono">
+                {repository?.defaultBranch ?? "the default branch"}
+              </span>
               <Button
-                onClick={handlePublish}
-                disabled={publishing || !task.workspacePath || !canPublish}
+                onClick={handleMerge}
+                disabled={merging || !task.workspacePath || !canMerge}
               >
-                {publishing ? (
+                {merging ? (
                   <Loader2 className="size-4 animate-spin" />
                 ) : (
-                  <GitPullRequest className="size-4" />
+                  <GitMerge className="size-4" />
                 )}
-                {pr ? "Re-publish" : "Create PR"}
+                Merge locally
               </Button>
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-col gap-2 text-sm">
-            {pr ? (
-              <a
-                href={pr.url}
-                target="_blank"
-                rel="noreferrer"
-                className="text-primary"
-              >
-                PR #{pr.number} ({pr.status})
-              </a>
-            ) : (
-              <p className="text-muted-foreground">No pull request yet.</p>
-            )}
-            {!githubAccount ? (
-              <p className="text-xs text-muted-foreground">
-                Connect GitHub in Settings to publish.
+            <p className="text-muted-foreground">
+              {repoHasOrigin
+                ? "Merges the task branch into the local default branch. This only affects the local clone and does not change the pull request."
+                : "This repository has no origin remote, so there is no pull request to open. The task branch will be merged into the local default branch."}
+            </p>
+            {task.status === "WAITING_FOR_REVIEW" ? (
+              <p className="flex items-center gap-1 text-xs text-muted-foreground">
+                <CheckCircle2 className="size-3.5" />
+                Merged locally.
               </p>
             ) : null}
-            {!canPublish && !pr ? (
+            {!canMerge && task.status !== "WAITING_FOR_REVIEW" ? (
               <p className="text-xs text-muted-foreground">
-                Available once the task is PR_CREATING (after commit).
+                Available once the task is PR_CREATED (after commit).
               </p>
             ) : null}
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardDescription>JIRA synchronization</CardDescription>
-            <CardTitle className="flex items-center justify-between">
-              {task.jiraIssueKey}
+        {!isCustomTask(task) ? (
+          <Card>
+            <CardHeader>
+              <CardDescription>JIRA synchronization</CardDescription>
+              <CardTitle className="flex items-center justify-between">
+                {taskLabel(task)}
               <Button
                 onClick={handleJiraSync}
                 disabled={jiraSyncing || !jiraAccount}
@@ -777,7 +874,8 @@ export function TaskRun() {
               </p>
             ) : null}
           </CardContent>
-        </Card>
+          </Card>
+        ) : null}
 
         <Card>
           <CardHeader>

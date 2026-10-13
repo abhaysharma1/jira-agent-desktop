@@ -1,5 +1,5 @@
 [package]
-name = "jira-agent-desktop"
+name = "ticketbridge-desktop"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "jira_agent_desktop_lib"
+name = "ticketbridge_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -42,6 +42,9 @@ keyring = { version = "3", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# `test` enables `tauri::test::mock_app` so AppHandle-backed code can be
+# exercised with the mock runtime. It only applies to `cargo test` builds.
+tauri = { version = "2", features = ["test"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

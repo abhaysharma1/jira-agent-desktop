@@ -107,3 +107,26 @@ fn request_complete(data: &[u8]) -> bool {
         .unwrap_or(0);
     data.len() >= index + 4 + content_length
 }
+
+/// A short-lived dummy child wrapped in a `ManagedServer`, so tests that need
+/// to register an `AgentRuntime` can give it a real (killable) process handle
+/// without spawning an opencode server. `ManagedServer::drop` kills the child.
+pub fn dummy_managed_server() -> crate::opencode::ManagedServer {
+    let child = if cfg!(windows) {
+        std::process::Command::new("cmd")
+            .args(["/c", "ping -n 60 127.0.0.1 > nul"])
+            .spawn()
+            .expect("spawn dummy child")
+    } else {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn dummy child")
+    };
+    crate::opencode::ManagedServer {
+        child,
+        base_url: "http://127.0.0.1:1".to_string(),
+        password: "dummy-password".to_string(),
+        port: 1,
+    }
+}

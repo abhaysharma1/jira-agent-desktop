@@ -61,7 +61,13 @@ pub fn record_run(app: &AppHandle, run: &AgentRun, success: bool, error: Option<
     match run.mode.as_str() {
         "planning" => {
             if let Some(ms) = duration {
-                record(app, "planning.duration_ms", ms, Some(&run.task_id), success_dim.clone());
+                record(
+                    app,
+                    "planning.duration_ms",
+                    ms,
+                    Some(&run.task_id),
+                    success_dim.clone(),
+                );
             }
         }
         "implementation" => {
@@ -123,7 +129,10 @@ mod tests {
     #[test]
     fn duration_is_none_without_finish_time() {
         assert_eq!(duration_ms("2026-10-07T00:00:00Z", None), None);
-        assert_eq!(duration_ms("not-a-date", Some("2026-10-07T00:00:00Z")), None);
+        assert_eq!(
+            duration_ms("not-a-date", Some("2026-10-07T00:00:00Z")),
+            None
+        );
     }
 
     #[test]

@@ -71,7 +71,7 @@ pub fn build_repair_prompt(
         .join("\n");
 
     format!(
-        "The implementation for JIRA ticket {key} ({title}) is failing its tests.\n\n\
+        "The implementation for ticket {key} ({title}) is failing its tests.\n\n\
 FAILING TEST OUTPUT\n\
 ===================\n\
 {failing_output}\n\n\

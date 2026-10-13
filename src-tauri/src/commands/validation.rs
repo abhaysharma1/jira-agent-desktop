@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::commands::runtime;
 use crate::db;
 use crate::domain::{
-    AgentRun, AgentRunStatus, PlanContent, TaskStatus, TestRun, ValidationConfig,
-    ValidationResult, ValidationRun,
+    AgentRun, AgentRunStatus, PlanContent, TaskStatus, TestRun, ValidationConfig, ValidationResult,
+    ValidationRun,
 };
 use crate::opencode;
 use crate::planning::TicketInput;
@@ -40,7 +40,12 @@ fn set_status(app: &AppHandle, task_id: &str, status: TaskStatus) {
 }
 
 fn fail(app: &AppHandle, task_id: &str, error: &str) {
-    set_status(app, task_id, TaskStatus::Failed);
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(connection) = state.db.lock() {
+            let _ = db::mark_task_failed(&connection, task_id, error, &now());
+        }
+        crate::commands::cloud_socket::emit_task_updated(app, &state, task_id);
+    }
     crate::logging::error(
         "validation",
         "task failed",
@@ -225,9 +230,18 @@ fn send_repair(
     let program = opencode::resolve_program(opencode::DEFAULT_COMMAND)?;
     let permission = opencode::IMPLEMENT_PERMISSION.to_string();
     let log_dir = state.data_dir.join("logs");
+    // Prefer an explicit override, then the task's planning model. This path is
+    // taken when no implementation runtime survives (e.g. after a restart), so
+    // the model the user picked while planning is otherwise lost.
+    let planning_model = state.db.lock().ok().and_then(|connection| {
+        db::latest_run_model(&connection, task_id, "planning")
+            .ok()
+            .flatten()
+    });
     let selected_model = model
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| opencode::models::DEFAULT_MODEL.to_string());
+        .or_else(|| planning_model.filter(|value| !value.trim().is_empty()))
+        .unwrap_or_else(|| super::settings::resolve_default_model(state.inner()));
     let config = opencode::models::inline_config(&selected_model);
     let dir = PathBuf::from(workspace_path);
     let session_title = "Repair".to_string();
@@ -341,7 +355,14 @@ fn run_validation_loop(app: &AppHandle, task_id: &str) {
                     .map(|version| version.content),
                 None => None,
             };
-            Ok((task, workspace_path, config, repair_enabled, max_attempts, plan))
+            Ok((
+                task,
+                workspace_path,
+                config,
+                repair_enabled,
+                max_attempts,
+                plan,
+            ))
         })()
     };
 
@@ -485,4 +506,3 @@ pub fn set_repair_on_validation_failure(
         &serde_json::json!(enabled),
     )
 }
-

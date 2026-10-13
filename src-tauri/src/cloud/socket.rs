@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tungstenite::client::{client, IntoClientRequest};
+use tungstenite::handshake::client::ClientHandshake;
+use tungstenite::handshake::HandshakeError;
 use tungstenite::http::header::AUTHORIZATION;
 use tungstenite::{Message, WebSocket};
 use url::Url;
@@ -45,13 +47,38 @@ pub struct CloudSocket {
     socket: WebSocket<TcpStream>,
 }
 
+/// Turns a tungstenite Handshake/transport error into an actionable message. A
+/// non-101 reply surfaces as `Error::Http` carrying the server's status; if a
+/// body came with it, a bounded, redacted snippet is included so the
+/// diagnostics distinguish "the server rejected the upgrade" (wrong route,
+/// proxy, or auth at the HTTP layer) from a transport failure. Never logs the
+/// device token or request headers.
+fn describe_handshake_error(error: tungstenite::Error) -> String {
+    let tungstenite::Error::Http(response) = error else {
+        return format!("cloud socket handshake failed: {error}");
+    };
+    let status = response.status();
+    let mut message = format!("cloud socket handshake failed: HTTP {status}");
+    if let Some(body) = response.body() {
+        if !body.is_empty() {
+            let snippet = crate::metrics::truncate(
+                &crate::logging::redact_secrets(&String::from_utf8_lossy(body)),
+                512,
+            );
+            if !snippet.is_empty() {
+                message.push_str(" (server replied: ");
+                message.push_str(&snippet);
+                message.push(')');
+            }
+        }
+    }
+    message
+}
+
 impl CloudSocket {
     /// Opens the socket and authenticates with the device token as a normal
     /// `Authorization` header during the handshake.
-    pub fn connect(
-        base_url: &str,
-        device_token: &str,
-    ) -> Result<(Self, TcpStream), String> {
+    pub fn connect(base_url: &str, device_token: &str) -> Result<(Self, TcpStream), String> {
         let ws_url = websocket_url(base_url);
         if ws_url.is_empty() {
             return Err("cloud base URL is required".to_string());
@@ -81,8 +108,14 @@ impl CloudSocket {
         let _ = stream.set_nodelay(true);
         let shutdown = stream.try_clone().map_err(|error| error.to_string())?;
 
-        let (socket, _response) =
-            client(request, stream).map_err(|error| format!("cloud socket handshake failed: {error}"))?;
+        let (socket, _response) = client(request, stream).map_err(|error| match error {
+            HandshakeError::<ClientHandshake<TcpStream>>::Failure(error) => {
+                describe_handshake_error(error)
+            }
+            HandshakeError::<ClientHandshake<TcpStream>>::Interrupted(_) => {
+                "cloud socket handshake failed: interrupted (would block)".to_string()
+            }
+        })?;
         Ok((Self { socket }, shutdown))
     }
 
@@ -92,8 +125,8 @@ impl CloudSocket {
         loop {
             match self.socket.read() {
                 Ok(Message::Text(text)) => {
-                    let value: Value =
-                        serde_json::from_str(&text.to_string()).map_err(|error| error.to_string())?;
+                    let value: Value = serde_json::from_str(&text.to_string())
+                        .map_err(|error| error.to_string())?;
                     return Ok(Some(value));
                 }
                 Ok(Message::Ping(payload)) => {
@@ -121,10 +154,7 @@ mod tests {
             websocket_url("https://api.example.com/"),
             "wss://api.example.com/ws"
         );
-        assert_eq!(
-            websocket_url("api.example.com"),
-            "wss://api.example.com/ws"
-        );
+        assert_eq!(websocket_url("api.example.com"), "wss://api.example.com/ws");
         assert_eq!(
             websocket_url("ws://localhost:4000"),
             "ws://localhost:4000/ws"
@@ -161,5 +191,36 @@ mod tests {
         drop(socket);
         drop(shutdown);
         let _ = server.join();
+    }
+
+    #[test]
+    fn handshake_rejection_reports_http_status() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            // A proxy/backend that refuses the upgrade answers 400 — exactly the
+            // failure the deployed backend returns. It may or may not read the
+            // request first; reading frees the request buffer.
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nbad request",
+            );
+            let _ = stream.flush();
+        });
+
+        let error = match CloudSocket::connect(&format!("ws://127.0.0.1:{port}"), "device-token") {
+            Err(error) => error,
+            Ok(_) => panic!("expected the fake 400 backend to reject the handshake"),
+        };
+        let _ = server.join();
+        assert!(
+            error.contains("handshake failed") && error.contains("HTTP 400"),
+            "unexpected error: {error}"
+        );
     }
 }

@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { api } from "@/api/tauri";
 import { notify } from "@/lib/desktopNotify";
+import { resolveTheme } from "@/lib/theme";
 import { TASK_TRANSITIONS } from "@/types";
 import type {
   AgentEvent,
@@ -13,6 +14,7 @@ import type {
   DiffStats,
   FileDiff,
   JiraConnectionInfo,
+  JiraIssue,
   JiraProjectRepo,
   JiraStatusMap,
   JiraSync,
@@ -24,8 +26,10 @@ import type {
   PullRequest,
   Repository,
   RepositoryStatus,
+  ResolvedTheme,
   TaskStatus,
   TestRun,
+  ThemePreference,
   TicketIntake,
   ValidationConfig,
   ValidationRun,
@@ -82,15 +86,22 @@ interface AppState {
   validationRuns: Record<string, ValidationRun[]>;
   repairOnValidationFailure: boolean;
   closeToTray: boolean;
+  theme: ThemePreference;
+  resolvedTheme: ResolvedTheme;
+  defaultModel: string | null;
   metrics: Metric[];
   logsDir: string;
   githubAccount: string | null;
   pullRequests: Record<string, PullRequest>;
   jiraAccount: string | null;
   jiraConnection: JiraConnectionInfo | null;
+  jiraOAuthConfigured: boolean;
   jiraStatusMap: JiraStatusMap;
   jiraSyncs: Record<string, JiraSync>;
   jiraProjectRepos: JiraProjectRepo[];
+  /** Candidate issues for the Task page ticket picker (JIRA search results). */
+  jiraTickets: JiraIssue[];
+  jiraTicketsLoading: boolean;
   cloudAccount: CloudAccount | null;
   notifications: CloudNotification[];
   cloudSocketStatus: CloudSocketStatus;
@@ -167,9 +178,16 @@ interface AppState {
     title?: string,
     body?: string,
   ) => Promise<void>;
+  mergeLocally: (taskId: string) => Promise<void>;
   loadPullRequest: (taskId: string) => Promise<void>;
   loadJira: () => Promise<void>;
+  loadJiraTickets: (query?: string) => Promise<void>;
   connectJira: () => Promise<void>;
+  saveJiraOAuthCredentials: (
+    clientId: string,
+    clientSecret: string,
+  ) => Promise<void>;
+  clearJiraOAuthCredentials: () => Promise<void>;
   registerJiraWebhook: () => Promise<void>;
   disconnectJira: () => Promise<void>;
   saveJiraStatusMap: (map: JiraStatusMap) => Promise<void>;
@@ -201,6 +219,11 @@ interface AppState {
   setRepairOnValidationFailure: (enabled: boolean) => Promise<void>;
   loadCloseToTray: () => Promise<void>;
   setCloseToTray: (enabled: boolean) => Promise<void>;
+  loadTheme: () => Promise<void>;
+  setTheme: (theme: ThemePreference) => Promise<void>;
+  setResolvedTheme: (theme: ResolvedTheme) => void;
+  loadDefaultModel: () => Promise<void>;
+  setDefaultModel: (model: string | null) => Promise<void>;
   loadMetrics: (name?: string, limit?: number) => Promise<void>;
   openLogsFolder: () => Promise<void>;
   revisePlan: (
@@ -210,11 +233,12 @@ interface AppState {
   ) => Promise<PlanMessage>;
   startPlanning: (
     repositoryId: string,
-    key: string,
+    key: string | undefined,
     title: string,
     description: string,
     acceptanceCriteria?: string,
     model?: string,
+    ticketSource?: "jira" | "custom",
   ) => Promise<AgentTask>;
   pushEvent: (event: AgentEvent) => void;
   setError: (error: string | null) => void;
@@ -237,15 +261,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   validationRuns: {},
   repairOnValidationFailure: false,
   closeToTray: true,
+  theme: "system",
+  resolvedTheme: resolveTheme("system"),
+  defaultModel: null,
   metrics: [],
   logsDir: "",
   githubAccount: null,
   pullRequests: {},
   jiraAccount: null,
   jiraConnection: null,
+  jiraOAuthConfigured: false,
   jiraStatusMap: {},
   jiraSyncs: {},
   jiraProjectRepos: [],
+  jiraTickets: [],
+  jiraTicketsLoading: false,
   cloudAccount: null,
   notifications: [],
   cloudSocketStatus: "signedOut",
@@ -971,6 +1001,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  mergeLocally: async (taskId) => {
+    set({ error: null });
+    try {
+      await api.mergeLocally(taskId);
+      await get().loadTasks();
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+
   loadPullRequest: async (taskId) => {
     try {
       const pr = await api.getPullRequest(taskId);
@@ -986,21 +1027,33 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   loadJira: async () => {
     try {
-      const [connection, account, jiraStatusMap, jiraProjectRepos] =
+      const [connection, account, jiraStatusMap, jiraProjectRepos, oauthConfigured] =
         await Promise.all([
           api.getJiraConnectionInfo(),
           api.getJiraAccount(),
           api.getJiraStatusMap(),
           api.listJiraProjectRepos(),
+          api.isJiraOAuthConfigured(),
         ]);
       set({
         jiraConnection: connection,
         jiraAccount: account,
         jiraStatusMap,
         jiraProjectRepos,
+        jiraOAuthConfigured: oauthConfigured,
       });
     } catch (error) {
       set({ error: String(error) });
+    }
+  },
+
+  loadJiraTickets: async (query) => {
+    set({ jiraTicketsLoading: true });
+    try {
+      const jiraTickets = await api.searchJiraIssues(query);
+      set({ jiraTickets, jiraTicketsLoading: false });
+    } catch (error) {
+      set({ jiraTickets: [], jiraTicketsLoading: false, error: String(error) });
     }
   },
 
@@ -1009,6 +1062,28 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       const connection = await api.startJiraOAuth();
       set({ jiraConnection: connection, jiraAccount: connection.account ?? null });
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+
+  saveJiraOAuthCredentials: async (clientId, clientSecret) => {
+    set({ error: null });
+    try {
+      await api.setJiraOAuthCredentials(clientId, clientSecret);
+      set({ jiraOAuthConfigured: true });
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+
+  clearJiraOAuthCredentials: async () => {
+    set({ error: null });
+    try {
+      await api.clearJiraOAuthCredentials();
+      set({ jiraOAuthConfigured: false });
     } catch (error) {
       set({ error: String(error) });
       throw error;
@@ -1030,7 +1105,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ error: null });
     try {
       await api.disconnectJira();
-      set({ jiraAccount: null, jiraConnection: null });
+      set({ jiraAccount: null, jiraConnection: null, jiraTickets: [] });
     } catch (error) {
       set({ error: String(error) });
       throw error;
@@ -1243,6 +1318,48 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  loadTheme: async () => {
+    try {
+      const theme = await api.getTheme();
+      set({ theme });
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
+
+  setTheme: async (theme) => {
+    // Apply immediately so the UI never lags behind the click; persist after.
+    set({ theme });
+    try {
+      await api.setTheme(theme);
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+
+  setResolvedTheme: (resolvedTheme) => set({ resolvedTheme }),
+
+  loadDefaultModel: async () => {
+    try {
+      const defaultModel = await api.getDefaultModel();
+      set({ defaultModel });
+    } catch (error) {
+      set({ error: String(error) });
+    }
+  },
+
+  setDefaultModel: async (model) => {
+    // Apply immediately so the pickers reflect the choice, then persist.
+    set({ defaultModel: model });
+    try {
+      await api.setDefaultModel(model);
+    } catch (error) {
+      set({ error: String(error) });
+      throw error;
+    }
+  },
+
   loadMetrics: async (name, limit) => {
     try {
       const metrics = await api.listMetrics(name, limit ?? 50);
@@ -1271,6 +1388,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     description,
     acceptanceCriteria,
     model,
+    ticketSource,
   ) => {
     set({ error: null });
     try {
@@ -1281,6 +1399,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         description,
         acceptanceCriteria,
         model,
+        ticketSource,
       );
       set((state) => ({
         tasks: [task, ...state.tasks],

@@ -55,7 +55,7 @@ pub fn build_prompt(ticket: &TicketInput, repo_path: &str) -> String {
         .unwrap_or("(none provided)");
 
     format!(
-        "Analyze this JIRA ticket against the repository at {repo_path}.\n\n\
+        "Analyze this ticket against the repository at {repo_path}.\n\n\
 TICKET\n\
 ======\n\
 {key}: {title}\n\n\
@@ -99,7 +99,7 @@ pub fn build_revision_seed_prompt(
 ) -> String {
     let plan_json = serde_json::to_string_pretty(current_plan).unwrap_or_default();
     format!(
-        "You previously produced an implementation plan for JIRA ticket {key} ({title}) in the repository at {repo_path}.\n\n\
+        "You previously produced an implementation plan for ticket {key} ({title}) in the repository at {repo_path}.\n\n\
 CURRENT PLAN (JSON)\n\
 ===================\n\
 {plan_json}\n\n\
@@ -170,8 +170,16 @@ fn content_from_value(ticket_key: &str, value: &Value) -> Result<PlanContent, St
         })
         .unwrap_or_default();
 
-    let tests = value.get("tests").and_then(Value::as_array).map(string_array).unwrap_or_default();
-    let risks = value.get("risks").and_then(Value::as_array).map(string_array).unwrap_or_default();
+    let tests = value
+        .get("tests")
+        .and_then(Value::as_array)
+        .map(string_array)
+        .unwrap_or_default();
+    let risks = value
+        .get("risks")
+        .and_then(Value::as_array)
+        .map(string_array)
+        .unwrap_or_default();
 
     if summary.is_empty() && steps.is_empty() {
         return Err("the agent returned an empty plan".to_string());

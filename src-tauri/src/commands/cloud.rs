@@ -26,7 +26,11 @@ fn ensure_device_id(state: &AppState) -> Result<String, String> {
     }
     let connection = state.db.lock().map_err(|error| error.to_string())?;
     let device_id = Uuid::new_v4().to_string();
-    db::set_setting(&connection, KEY_DEVICE_ID, &Value::String(device_id.clone()))?;
+    db::set_setting(
+        &connection,
+        KEY_DEVICE_ID,
+        &Value::String(device_id.clone()),
+    )?;
     Ok(device_id)
 }
 
@@ -39,7 +43,7 @@ pub fn login_cloud(
     register: bool,
 ) -> Result<CloudAccount, String> {
     let device_id = ensure_device_id(&state)?;
-    let device_name = "JIRA Agent Desktop".to_string();
+    let device_name = "TicketBridge Desktop".to_string();
     let platform = std::env::consts::OS.to_string();
     let email = email.trim().to_string();
 

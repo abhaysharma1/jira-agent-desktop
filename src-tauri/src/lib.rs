@@ -13,8 +13,8 @@ mod opencode;
 mod panic_hook;
 mod planning;
 mod repository;
-mod secure_store;
 mod secrets;
+mod secure_store;
 mod state;
 #[cfg(test)]
 mod test_support;
@@ -25,7 +25,7 @@ mod workspace;
 use std::path::PathBuf;
 use tauri::Manager;
 
-const APP_DIR: &str = ".jira-agent";
+const APP_DIR: &str = ".ticketbridge";
 
 fn app_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let home = std::env::var_os("USERPROFILE")
@@ -47,7 +47,13 @@ pub fn run() {
                 let app = window.app_handle();
                 let hide = app
                     .try_state::<state::AppState>()
-                    .and_then(|state| state.db.lock().ok().map(|connection| db::close_to_tray(&connection)))
+                    .and_then(|state| {
+                        state
+                            .db
+                            .lock()
+                            .ok()
+                            .map(|connection| db::close_to_tray(&connection))
+                    })
                     .unwrap_or(false);
                 if hide {
                     api.prevent_close();
@@ -60,7 +66,7 @@ pub fn run() {
             for dir in [root.clone(), root.join("workspaces"), root.join("logs")] {
                 std::fs::create_dir_all(&dir)?;
             }
-            // Phase 26: structured logs land in ~/.jira-agent/logs.
+            // Phase 26: structured logs land in ~/.ticketbridge/logs.
             crate::logging::init(&root.join("logs"));
             // Phase 27: capture uncaught panics in that same log.
             crate::panic_hook::install();
@@ -135,8 +141,12 @@ pub fn run() {
             commands::set_github_token,
             commands::get_github_account,
             commands::create_pull_request,
+            commands::merge_locally,
             commands::get_pull_request,
             commands::start_jira_oauth,
+            commands::jira_oauth_configured,
+            commands::set_jira_oauth_credentials,
+            commands::clear_jira_oauth_credentials,
             commands::get_jira_connection_info,
             commands::register_jira_webhook,
             commands::disconnect_jira,
@@ -144,6 +154,7 @@ pub fn run() {
             commands::get_jira_status_map,
             commands::set_jira_status_map,
             commands::get_jira_issue,
+            commands::search_jira_issues,
             commands::list_jira_transitions,
             commands::get_jira_sync,
             commands::sync_task_jira,
@@ -164,6 +175,10 @@ pub fn run() {
             commands::quit_app,
             commands::get_close_to_tray,
             commands::set_close_to_tray,
+            commands::get_theme,
+            commands::set_theme,
+            commands::get_default_model,
+            commands::set_default_model,
             commands::list_metrics,
             commands::get_logs_dir,
             commands::open_logs_folder,

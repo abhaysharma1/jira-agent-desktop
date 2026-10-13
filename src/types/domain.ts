@@ -82,9 +82,13 @@ export interface RepositoryStatus {
   changedFiles: number;
 }
 
+export type TicketSource = "jira" | "custom";
+
 export interface AgentTask {
   id: string;
   jiraIssueKey: string;
+  /** Whether the task came from JIRA or was created locally without a ticket. */
+  ticketSource: TicketSource;
   title: string;
   description: string;
 
@@ -100,9 +104,26 @@ export interface AgentTask {
   commitHash?: string | null;
 
   interruptedFrom?: string | null;
+  failureReason?: string | null;
 
   createdAt: string;
   updatedAt: string;
+}
+
+export function isCustomTask(
+  task: Pick<AgentTask, "ticketSource">,
+): boolean {
+  return task.ticketSource === "custom";
+}
+
+/**
+ * The identity shown for a task everywhere: `KEY - Title` for JIRA tickets, and
+ * just the title for custom tasks (which have no real ticket key).
+ */
+export function taskLabel(
+  task: Pick<AgentTask, "jiraIssueKey" | "title" | "ticketSource">,
+): string {
+  return isCustomTask(task) ? task.title : `${task.jiraIssueKey} - ${task.title}`;
 }
 
 export interface PlanStep {
@@ -372,6 +393,12 @@ export interface SearchHit {
 }
 
 export type CloudSocketStatus = "signedOut" | "connecting" | "online" | "offline";
+
+/** The user's theme choice. `"system"` follows the OS `prefers-color-scheme`. */
+export type ThemePreference = "light" | "dark" | "system";
+
+/** The theme actually applied after resolving `"system"`. */
+export type ResolvedTheme = "light" | "dark";
 
 /** A server-pushed WebSocket event: `{ event, ...payload }`. */
 export interface CloudEvent {

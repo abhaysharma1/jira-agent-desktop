@@ -9,6 +9,8 @@ import {
   ClipboardList,
   FileText,
   FlaskConical,
+  GitMerge,
+  GitPullRequest,
   ListChecks,
   Loader2,
   Play,
@@ -28,6 +30,7 @@ import {
 } from "@/components/ui/card";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { useAppStore } from "@/stores/appStore";
+import { taskLabel } from "@/types";
 import type { TaskStatus } from "@/types";
 
 function statusVariant(
@@ -68,6 +71,7 @@ export function PlanReview() {
   const revisePlan = useAppStore((state) => state.revisePlan);
   const startImplementation = useAppStore((state) => state.startImplementation);
   const resumeTask = useAppStore((state) => state.resumeTask);
+  const mergeLocally = useAppStore((state) => state.mergeLocally);
 
   const [busy, setBusy] = useState(false);
   const [revising, setRevising] = useState(false);
@@ -156,7 +160,7 @@ export function PlanReview() {
       return;
     }
     const confirmed = await ask(
-      `Reject the plan for ${task.jiraIssueKey}?`,
+      `Reject the plan for ${taskLabel(task)}?`,
       { title: "Reject plan", kind: "warning" },
     );
     if (!confirmed) {
@@ -215,6 +219,20 @@ export function PlanReview() {
     }
   }
 
+  async function handleMerge() {
+    if (!task) {
+      return;
+    }
+    setBusy(true);
+    try {
+      await mergeLocally(task.id);
+    } catch {
+      // Surfaced through the store.
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!task) {
     return (
       <div className="flex flex-col">
@@ -235,7 +253,7 @@ export function PlanReview() {
   return (
     <div className="flex flex-col">
       <PageHeader
-        title={`${task.jiraIssueKey} - ${task.title}`}
+        title={taskLabel(task)}
         description={repository ? repository.name : task.repositoryId}
       />
       <div className="flex flex-col gap-4 p-6">
@@ -536,6 +554,79 @@ export function PlanReview() {
                   )}
                   Resume
                 </Button>
+                <Button variant="outline" onClick={handleMerge} disabled={busy}>
+                  <GitMerge className="size-4" />
+                  Merge locally
+                </Button>
+                <Link to={`/tasks/${task.id}/run`} className="text-primary">
+                  Open execution
+                </Link>
+              </div>
+            ) : task.status === "FAILED" ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex flex-wrap items-center gap-3">
+                  <p className="flex items-center gap-2 text-sm text-destructive">
+                    <AlertTriangle className="size-4" />
+                    Failed during {task.interruptedFrom ?? "a previous run"}.
+                  </p>
+                  <Button onClick={handleResume} disabled={busy}>
+                    {busy ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <RotateCcw className="size-4" />
+                    )}
+                    Retry
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={handleMerge}
+                    disabled={busy}
+                  >
+                    <GitMerge className="size-4" />
+                    Merge locally
+                  </Button>
+                  <Link to={`/tasks/${task.id}/run`} className="text-primary">
+                    Open execution
+                  </Link>
+                </div>
+                {task.failureReason ? (
+                  <p className="text-xs text-destructive">
+                    {task.failureReason}
+                  </p>
+                ) : null}
+              </div>
+            ) : task.status === "PR_CREATED" ? (
+              <div className="flex flex-wrap items-center gap-3">
+                <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <GitPullRequest className="size-4" />
+                  Pull request created. Merge the branch locally or open
+                  execution.
+                </p>
+                <Button
+                  variant="outline"
+                  onClick={handleMerge}
+                  disabled={busy}
+                >
+                  {busy ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <GitMerge className="size-4" />
+                  )}
+                  Merge locally
+                </Button>
+                <Link to={`/tasks/${task.id}/run`} className="text-primary">
+                  Open execution
+                </Link>
+              </div>
+            ) : task.status === "WAITING_FOR_REVIEW" ? (
+              <div className="flex flex-wrap items-center gap-3">
+                <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <CheckCircle2 className="size-4" />
+                  Merged into the local default branch. Waiting for review.
+                </p>
+                <Link to={`/tasks/${task.id}/run`} className="text-primary">
+                  Open execution
+                </Link>
               </div>
             ) : task.status === "REJECTED" ? (
               <p className="flex items-center gap-2 text-sm text-muted-foreground">

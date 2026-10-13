@@ -4,7 +4,7 @@
 //! half — an uncaught panic writes one `panic` line into the Phase 26
 //! structured log before the process dies. The release profile uses
 //! `panic = "abort"`, but the panic hook still runs first, so the last record a
-//! crashed install leaves behind is readable in `~/.jira-agent/logs/`.
+//! crashed install leaves behind is readable in `~/.ticketbridge/logs/`.
 
 use std::panic::PanicHookInfo;
 use std::sync::Once;

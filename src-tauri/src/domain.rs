@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+use serde::{Deserialize, Serialize};
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskStatus {
     Received,
@@ -46,7 +47,9 @@ impl TaskStatus {
             // Interrupted tasks are recovered by restarting the stage recorded
             // in `interrupted_from`; the transition table lists those entry
             // points so the UI can reason about a resume.
-            Interrupted => &[Planning, Approved, Testing, Validating, Committing, PrCreating],
+            Interrupted => &[
+                Planning, Approved, Testing, Validating, Committing, PrCreating,
+            ],
             Failed => &[],
         }
     }
@@ -89,11 +92,24 @@ pub struct RepositoryStatus {
     pub changed_files: u32,
 }
 
+/// Where a task came from: a real JIRA issue, or a locally created "custom"
+/// task that has no JIRA ticket behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TicketSource {
+    #[default]
+    Jira,
+    Custom,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTask {
     pub id: String,
     pub jira_issue_key: String,
+    /// Whether the task came from JIRA or was created locally without a ticket.
+    #[serde(default)]
+    pub ticket_source: TicketSource,
     pub title: String,
     pub description: String,
     pub repository_id: String,
@@ -103,9 +119,12 @@ pub struct AgentTask {
     pub workspace_path: Option<String>,
     pub branch_name: Option<String>,
     pub commit_hash: Option<String>,
-    /// The status the task was in when the app shut down mid-run. Set only
-    /// while `status == Interrupted`, cleared on resume.
+    /// The stage the task was in when it was interrupted by an app restart
+    /// (`status == Interrupted`) or failed (`status == Failed`). Cleared on
+    /// resume/retry. Retry re-enters the stage recorded here.
     pub interrupted_from: Option<String>,
+    /// Why the task failed, when `status == Failed`. Cleared on retry.
+    pub failure_reason: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

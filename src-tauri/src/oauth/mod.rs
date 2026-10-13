@@ -39,7 +39,10 @@ impl OAuthConfig {
             client_secret,
             auth_base: DEFAULT_AUTH_BASE.to_string(),
             api_base: DEFAULT_API_BASE.to_string(),
-            scopes: DEFAULT_SCOPES.iter().map(|scope| scope.to_string()).collect(),
+            scopes: DEFAULT_SCOPES
+                .iter()
+                .map(|scope| scope.to_string())
+                .collect(),
         }
     }
 
@@ -52,7 +55,7 @@ impl OAuthConfig {
 
     fn http(&self) -> Result<reqwest::blocking::Client, String> {
         reqwest::blocking::Client::builder()
-            .user_agent("jira-agent-desktop")
+            .user_agent("ticketbridge-desktop")
             .build()
             .map_err(|error| error.to_string())
     }
@@ -70,7 +73,10 @@ impl OAuthConfig {
     fn token_request(&self, form: &[(&str, &str)]) -> Result<TokenResponse, String> {
         let response = self
             .http()?
-            .post(format!("{}/oauth/token", self.auth_base.trim_end_matches('/')))
+            .post(format!(
+                "{}/oauth/token",
+                self.auth_base.trim_end_matches('/')
+            ))
             .header("Accept", "application/json")
             .form(form)
             .send()
@@ -164,11 +170,7 @@ pub struct AccessibleResource {
 }
 
 pub fn generate_verifier() -> String {
-    format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    )
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
 pub fn challenge_for(verifier: &str) -> String {
@@ -223,8 +225,7 @@ impl CallbackListener {
     }
 
     pub fn bind_on(port: u16) -> Result<Self, String> {
-        let listener =
-            TcpListener::bind(("127.0.0.1", port)).map_err(|error| error.to_string())?;
+        let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|error| error.to_string())?;
         let port = listener
             .local_addr()
             .map_err(|error| error.to_string())?
@@ -270,7 +271,11 @@ impl CallbackListener {
                     );
                 }
                 Err(error) => {
-                    let _ = respond(&mut stream, 400, &format!("<h1>Authorization failed</h1><p>{error}</p>"));
+                    let _ = respond(
+                        &mut stream,
+                        400,
+                        &format!("<h1>Authorization failed</h1><p>{error}</p>"),
+                    );
                 }
             }
             return result;
@@ -302,10 +307,7 @@ pub fn parse_request_line(request_line: &str) -> (String, HashMap<String, String
             Some((key, value)) => (key, value),
             None => (pair, ""),
         };
-        params.insert(
-            percent_decode(key),
-            percent_decode(value),
-        );
+        params.insert(percent_decode(key), percent_decode(value));
     }
     (path, params)
 }
@@ -319,7 +321,9 @@ fn validate_callback(
             .get("error_description")
             .map(String::as_str)
             .unwrap_or_default();
-        return Err(format!("JIRA authorization failed: {error} {description}").trim().to_string());
+        return Err(format!("JIRA authorization failed: {error} {description}")
+            .trim()
+            .to_string());
     }
     let state = params
         .get("state")
@@ -439,7 +443,8 @@ mod tests {
 
     #[test]
     fn exchanges_code_and_lists_resources_against_mock() {
-        let server = MockServer::start(|request, body| match request {
+        let server = MockServer::start(|request, body| {
+            match request {
             "POST /oauth/token" => {
                 assert!(body.contains("grant_type=authorization_code"));
                 assert!(body.contains("code=the-code"));
@@ -454,6 +459,7 @@ mod tests {
                 r#"[{"id":"cloud-1","url":"https://acme.atlassian.net","name":"Acme","scopes":["read:jira-work"]}]"#.to_string(),
             ),
             _ => (404, r#"{"error":"not found"}"#.to_string()),
+        }
         });
         let config = test_config(&server.base_url());
 
@@ -492,7 +498,10 @@ mod tests {
     #[test]
     fn surfaces_oauth_errors() {
         let server = MockServer::start(|_request, _body| {
-            (400, r#"{"error":"invalid_grant","error_description":"code expired"}"#.to_string())
+            (
+                400,
+                r#"{"error":"invalid_grant","error_description":"code expired"}"#.to_string(),
+            )
         });
         let config = test_config(&server.base_url());
         let error = config

@@ -23,7 +23,7 @@ pub fn get_logs_dir(state: State<AppState>) -> Result<String, String> {
     Ok(state.data_dir.join("logs").to_string_lossy().to_string())
 }
 
-/// Opens `~/.jira-agent/logs` in the OS file manager.
+/// Opens `~/.ticketbridge/logs` in the OS file manager.
 #[tauri::command]
 pub fn open_logs_folder(app: AppHandle) -> Result<(), String> {
     let state = app

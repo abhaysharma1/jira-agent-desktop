@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { Monitor, Moon, Sun } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -9,12 +10,23 @@ import {
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { PageHeader } from "@/components/layout/PageHeader";
+import { JiraCredentialsDialog } from "@/components/jira/JiraCredentialsDialog";
 import { api } from "@/api/tauri";
 import { useAppStore } from "@/stores/appStore";
-import type { Settings as SettingsModel } from "@/types";
+import type { Settings as SettingsModel, ThemePreference } from "@/types";
+
+const themeOptions: Array<{
+  value: ThemePreference;
+  label: string;
+  icon: typeof Sun;
+}> = [
+  { value: "light", label: "Light", icon: Sun },
+  { value: "dark", label: "Dark", icon: Moon },
+  { value: "system", label: "System", icon: Monitor },
+];
 
 const defaults: SettingsModel = {
-  workspaceRoot: "~/.jira-agent/workspaces",
+  workspaceRoot: "~/.ticketbridge/workspaces",
   maxRepairAttempts: 5,
   opencodeCommand: "opencode",
 };
@@ -53,6 +65,7 @@ export function Settings() {
   const githubAccount = useAppStore((state) => state.githubAccount);
   const jiraAccount = useAppStore((state) => state.jiraAccount);
   const jiraConnection = useAppStore((state) => state.jiraConnection);
+  const jiraOAuthConfigured = useAppStore((state) => state.jiraOAuthConfigured);
   const jiraStatusMap = useAppStore((state) => state.jiraStatusMap);
   const jiraProjectRepos = useAppStore((state) => state.jiraProjectRepos);
   const repositories = useAppStore((state) => state.repositories);
@@ -61,6 +74,12 @@ export function Settings() {
   const setGithubToken = useAppStore((state) => state.setGithubToken);
   const loadJira = useAppStore((state) => state.loadJira);
   const connectJira = useAppStore((state) => state.connectJira);
+  const saveJiraOAuthCredentials = useAppStore(
+    (state) => state.saveJiraOAuthCredentials,
+  );
+  const clearJiraOAuthCredentials = useAppStore(
+    (state) => state.clearJiraOAuthCredentials,
+  );
   const registerJiraWebhook = useAppStore((state) => state.registerJiraWebhook);
   const disconnectJira = useAppStore((state) => state.disconnectJira);
   const saveJiraStatusMap = useAppStore((state) => state.saveJiraStatusMap);
@@ -73,13 +92,21 @@ export function Settings() {
   const closeToTray = useAppStore((state) => state.closeToTray);
   const loadCloseToTray = useAppStore((state) => state.loadCloseToTray);
   const setCloseToTray = useAppStore((state) => state.setCloseToTray);
+  const theme = useAppStore((state) => state.theme);
+  const setTheme = useAppStore((state) => state.setTheme);
   const metrics = useAppStore((state) => state.metrics);
   const logsDir = useAppStore((state) => state.logsDir);
   const loadMetrics = useAppStore((state) => state.loadMetrics);
   const openLogsFolder = useAppStore((state) => state.openLogsFolder);
+  const models = useAppStore((state) => state.models);
+  const defaultModel = useAppStore((state) => state.defaultModel);
+  const loadModels = useAppStore((state) => state.loadModels);
+  const loadDefaultModel = useAppStore((state) => state.loadDefaultModel);
+  const setDefaultModel = useAppStore((state) => state.setDefaultModel);
   const [token, setToken] = useState("");
   const [saved, setSaved] = useState(false);
   const [jiraBusy, setJiraBusy] = useState(false);
+  const [credsOpen, setCredsOpen] = useState(false);
   const [webhookBusy, setWebhookBusy] = useState(false);
   const [projectKey, setProjectKey] = useState("");
   const [projectRepo, setProjectRepo] = useState("");
@@ -112,19 +139,60 @@ export function Settings() {
   }, [loadMetrics]);
 
   useEffect(() => {
+    void loadModels();
+    void loadDefaultModel();
+  }, [loadModels, loadDefaultModel]);
+
+  useEffect(() => {
     setStatusOpened(jiraStatusMap.opened ?? "");
     setStatusMerged(jiraStatusMap.merged ?? "");
     setStatusClosed(jiraStatusMap.closed ?? "");
   }, [jiraStatusMap]);
 
+  const groupedModels = useMemo(() => {
+    const groups = new Map<string, typeof models>();
+    for (const item of models) {
+      const list = groups.get(item.providerId) ?? [];
+      list.push(item);
+      groups.set(item.providerId, list);
+    }
+    return Array.from(groups.entries());
+  }, [models]);
+
   async function handleJiraConnect() {
     setJiraBusy(true);
     try {
+      const configured = await api.isJiraOAuthConfigured();
+      if (!configured) {
+        setCredsOpen(true);
+        return;
+      }
       await connectJira();
     } catch {
       // Surfaced through the store.
     } finally {
       setJiraBusy(false);
+    }
+  }
+
+  async function handleJiraCredentialsSubmit(
+    clientId: string,
+    clientSecret: string,
+  ) {
+    try {
+      await saveJiraOAuthCredentials(clientId, clientSecret);
+      setCredsOpen(false);
+      await handleJiraConnect();
+    } catch {
+      // Surfaced through the store.
+    }
+  }
+
+  async function handleClearJiraCredentials() {
+    try {
+      await clearJiraOAuthCredentials();
+    } catch {
+      // Surfaced through the store.
     }
   }
 
@@ -189,6 +257,22 @@ export function Settings() {
     }
   }
 
+  async function handleTheme(value: ThemePreference) {
+    try {
+      await setTheme(value);
+    } catch {
+      // Surfaced through the store.
+    }
+  }
+
+  async function handleDefaultModel(value: string) {
+    try {
+      await setDefaultModel(value.trim() || null);
+    } catch {
+      // Surfaced through the store.
+    }
+  }
+
   function handleQuit() {
     void api.quitApp().catch(() => {});
   }
@@ -197,7 +281,6 @@ export function Settings() {
     ["Workspace root", defaults.workspaceRoot],
     ["Max repair attempts", String(defaults.maxRepairAttempts)],
     ["OpenCode command", defaults.opencodeCommand],
-    ["OpenCode model", defaults.opencodeModel ?? "default"],
   ];
 
   async function handleSave() {
@@ -241,6 +324,68 @@ export function Settings() {
                 </div>
               </div>
             ))}
+            <Separator />
+            <div className="flex flex-col gap-1">
+              <span className="text-muted-foreground">Default AI model</span>
+              <select
+                className="h-8 rounded-lg border border-input bg-background px-2 text-sm text-foreground"
+                value={defaultModel ?? ""}
+                onChange={(event) => void handleDefaultModel(event.target.value)}
+              >
+                <option value="">
+                  Built-in default (opencode/nemotron-3-ultra-free)
+                </option>
+                {defaultModel &&
+                !models.some((item) => item.id === defaultModel) ? (
+                  <option value={defaultModel}>{defaultModel}</option>
+                ) : null}
+                {groupedModels.map(([providerId, items]) => (
+                  <optgroup key={providerId} label={providerId}>
+                    {items.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name} {item.free ? "(free)" : "(paid)"}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Used for new planning, implementation and agent runs unless you
+                pick another model.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="max-w-xl">
+          <CardHeader>
+            <CardTitle>Appearance</CardTitle>
+            <CardDescription>
+              Choose how TicketBridge looks.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3 text-sm">
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">Theme</span>
+              <div className="flex gap-2">
+                {themeOptions.map(({ value, label, icon: Icon }) => (
+                  <Button
+                    key={value}
+                    variant={theme === value ? "default" : "outline"}
+                    size="sm"
+                    aria-pressed={theme === value}
+                    onClick={() => void handleTheme(value)}
+                  >
+                    <Icon className="size-3.5" />
+                    {label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              "System" automatically matches your operating system's light or
+              dark setting.
+            </p>
           </CardContent>
         </Card>
 
@@ -255,11 +400,11 @@ export function Settings() {
                 checked={closeToTray}
                 onChange={(event) => void handleCloseToTray(event.target.checked)}
               />
-              <span>Closing the window keeps JIRA Agent in the system tray</span>
+              <span>Closing the window keeps TicketBridge in the system tray</span>
             </label>
             <Separator />
             <div className="flex items-center justify-between">
-              <span className="text-muted-foreground">Quit JIRA Agent</span>
+              <span className="text-muted-foreground">Quit TicketBridge</span>
               <Button variant="outline" onClick={handleQuit}>
                 Quit
               </Button>
@@ -380,6 +525,21 @@ export function Settings() {
                 disabled={!jiraConnection}
               >
                 Disconnect
+              </Button>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs text-muted-foreground">
+                {jiraOAuthConfigured
+                  ? "OAuth app credentials saved"
+                  : "No OAuth app credentials saved"}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void handleClearJiraCredentials()}
+                disabled={!jiraOAuthConfigured}
+              >
+                Clear credentials
               </Button>
             </div>
             {jiraAccount ? (
@@ -602,6 +762,13 @@ export function Settings() {
           </CardContent>
         </Card>
       </div>
+
+      <JiraCredentialsDialog
+        open={credsOpen}
+        busy={jiraBusy}
+        onClose={() => setCredsOpen(false)}
+        onSubmit={handleJiraCredentialsSubmit}
+      />
     </div>
   );
 }

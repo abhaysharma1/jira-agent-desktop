@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { PageHeader } from "@/components/layout/PageHeader";
 import { useAppStore } from "@/stores/appStore";
+import { taskLabel } from "@/types";
 
 const LANGUAGE_BY_EXT: Record<string, string> = {
   ts: "typescript",
@@ -64,6 +65,7 @@ export function TaskDiff() {
   const tasks = useAppStore((state) => state.tasks);
   const diffs = useAppStore((state) => state.workspaceDiffs[taskId]);
   const error = useAppStore((state) => state.error);
+  const resolvedTheme = useAppStore((state) => state.resolvedTheme);
   const loadTasks = useAppStore((state) => state.loadTasks);
   const loadWorkspaceDiffs = useAppStore((state) => state.loadWorkspaceDiffs);
 
@@ -118,7 +120,7 @@ export function TaskDiff() {
   return (
     <div className="flex flex-col">
       <PageHeader
-        title={`${task.jiraIssueKey} - Changes`}
+        title={`${taskLabel(task)} - Changes`}
         description={task.branchName ?? task.repositoryId}
       />
       <div className="flex flex-col gap-4 p-6">
@@ -196,7 +198,7 @@ export function TaskDiff() {
                             original={file.original}
                             modified={file.modified}
                             language={languageFor(file.path)}
-                            theme="vs-dark"
+                            theme={resolvedTheme === "dark" ? "vs-dark" : "vs"}
                             height="360px"
                             options={{
                               readOnly: true,

@@ -8,7 +8,7 @@ use crate::commands::{implementation, runtime};
 use crate::db;
 use crate::domain::{
     AgentRun, AgentRunStatus, AgentTask, PlanApproval, PlanMessage, PlanVersion, Repository,
-    TaskStatus,
+    TaskStatus, TicketSource,
 };
 use crate::opencode::{self, PromptCallbacks};
 use crate::planning::{self, TicketInput};
@@ -21,7 +21,14 @@ fn now() -> String {
 fn find_planning_runtime(
     state: &AppState,
     task_id: &str,
-) -> Option<(String, String, String, String, Option<String>, Option<String>)> {
+) -> Option<(
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+)> {
     let agents = state.agents.lock().ok()?;
     let runtime = agents
         .values()
@@ -43,12 +50,37 @@ pub fn start_planning(
     app: AppHandle,
     state: State<AppState>,
     repository_id: String,
-    key: String,
+    key: Option<String>,
     title: String,
     description: String,
     acceptance_criteria: Option<String>,
     model: Option<String>,
+    ticket_source: Option<String>,
 ) -> Result<AgentTask, String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("a task title is required".to_string());
+    }
+
+    // A custom task has no JIRA issue. We still store a stable key so the row,
+    // branch name and plan content stay non-empty; a blank custom id gets a
+    // generated local placeholder that is never sent to JIRA.
+    let trimmed_key = key.unwrap_or_default().trim().to_string();
+    let wants_custom = matches!(ticket_source.as_deref(), Some("custom"));
+    let (stored_key, source) = if wants_custom || trimmed_key.is_empty() {
+        let key = if trimmed_key.is_empty() {
+            format!(
+                "LOCAL-{}",
+                &Uuid::new_v4().simple().to_string()[..6].to_uppercase()
+            )
+        } else {
+            trimmed_key
+        };
+        (key, TicketSource::Custom)
+    } else {
+        (trimmed_key, TicketSource::Jira)
+    };
+
     let repository = {
         let connection = state.db.lock().map_err(|error| error.to_string())?;
         db::get_repository(&connection, &repository_id)?
@@ -64,7 +96,7 @@ pub fn start_planning(
     }
 
     let ticket = TicketInput {
-        key: key.clone(),
+        key: stored_key.clone(),
         title: title.clone(),
         description: description.clone(),
         acceptance_criteria: acceptance_criteria.clone(),
@@ -72,7 +104,8 @@ pub fn start_planning(
 
     let task = AgentTask {
         id: Uuid::new_v4().to_string(),
-        jira_issue_key: key,
+        jira_issue_key: stored_key,
+        ticket_source: source,
         title,
         description,
         repository_id: repository.id.clone(),
@@ -83,6 +116,7 @@ pub fn start_planning(
         branch_name: None,
         commit_hash: None,
         interrupted_from: None,
+        failure_reason: None,
         created_at: now(),
         updated_at: now(),
     };
@@ -99,11 +133,7 @@ pub fn start_planning(
 
 /// Restarts planning for an existing task whose planning run was interrupted.
 /// Reuses the task row, ticket fields, and repository mapping already stored.
-pub fn resume_planning(
-    app: &AppHandle,
-    state: &AppState,
-    task: &AgentTask,
-) -> Result<(), String> {
+pub fn resume_planning(app: &AppHandle, state: &AppState, task: &AgentTask) -> Result<(), String> {
     let repository = {
         let connection = state.db.lock().map_err(|error| error.to_string())?;
         db::get_repository(&connection, &task.repository_id)?
@@ -139,7 +169,7 @@ fn spawn_planning_run(
     let log_dir = state.data_dir.join("logs");
     let selected_model = model
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| opencode::models::DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| super::settings::resolve_default_model(state));
     let config = opencode::models::inline_config(&selected_model);
     let session_title = format!("Plan {}", ticket.key);
     let dir_for_thread = dir.clone();
@@ -240,11 +270,12 @@ fn plan_success(app: &AppHandle, task_id: &str, ticket_key: &str, value: &Value)
             Ok(connection) => connection,
             Err(_) => return,
         };
-        db::store_plan_version(&connection, task_id, content, "agent", &timestamp)
-            .and_then(|(plan, version)| {
+        db::store_plan_version(&connection, task_id, content, "agent", &timestamp).and_then(
+            |(plan, version)| {
                 db::update_task_status(&connection, task_id, TaskStatus::PlanReady, &now())?;
                 Ok((plan, version))
-            })
+            },
+        )
     };
 
     match result {
@@ -274,12 +305,16 @@ fn commit_revision(app: &AppHandle, task_id: &str, ticket_key: &str, value: &Val
             Ok(connection) => connection,
             Err(_) => return,
         };
-        let (plan, version) =
-            match db::store_plan_version(&connection, task_id, content.clone(), "agent", &timestamp)
-            {
-                Ok(result) => result,
-                Err(error) => return fail_revision(app, task_id, &error),
-            };
+        let (plan, version) = match db::store_plan_version(
+            &connection,
+            task_id,
+            content.clone(),
+            "agent",
+            &timestamp,
+        ) {
+            Ok(result) => result,
+            Err(error) => return fail_revision(app, task_id, &error),
+        };
         let message = PlanMessage {
             id: Uuid::new_v4().to_string(),
             task_id: task_id.to_string(),
@@ -310,7 +345,7 @@ fn task_failed(app: &AppHandle, task_id: &str, error: &str) {
     );
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(connection) = state.db.lock() {
-            let _ = db::update_task_status(&connection, task_id, TaskStatus::Failed, &now());
+            let _ = db::mark_task_failed(&connection, task_id, error, &now());
         }
     }
     let _ = app.emit(
@@ -339,10 +374,7 @@ pub fn get_task(state: State<AppState>, task_id: String) -> Result<AgentTask, St
 }
 
 #[tauri::command]
-pub fn get_plan(
-    state: State<AppState>,
-    task_id: String,
-) -> Result<Option<PlanVersion>, String> {
+pub fn get_plan(state: State<AppState>, task_id: String) -> Result<Option<PlanVersion>, String> {
     let connection = state.db.lock().map_err(|error| error.to_string())?;
     db::latest_plan_version(&connection, &task_id)
 }
@@ -515,7 +547,7 @@ pub fn revise_plan(
     let log_dir = state.data_dir.join("logs");
     let selected_model = model
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| opencode::models::DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| super::settings::resolve_default_model(state.inner()));
     let config = opencode::models::inline_config(&selected_model);
     let seed_prompt = planning::build_revision_seed_prompt(
         &ticket,

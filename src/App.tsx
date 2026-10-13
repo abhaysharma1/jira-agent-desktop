@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { HashRouter, Route, Routes } from "react-router-dom";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { Dashboard } from "@/pages/Dashboard";
@@ -8,8 +9,44 @@ import { TaskRun } from "@/pages/TaskRun";
 import { TaskDiff } from "@/pages/TaskDiff";
 import { Agent } from "@/pages/Agent";
 import { Settings } from "@/pages/Settings";
+import { applyTheme, resolveTheme, subscribeSystemTheme } from "@/lib/theme";
+import { useAppStore } from "@/stores/appStore";
+
+/**
+ * Loads the persisted theme and keeps `<html>` in sync with the resolved
+ * light/dark value, including live OS changes while in "system" mode.
+ */
+function useTheme() {
+  const theme = useAppStore((state) => state.theme);
+  const loadTheme = useAppStore((state) => state.loadTheme);
+  const setResolvedTheme = useAppStore((state) => state.setResolvedTheme);
+
+  useEffect(() => {
+    void loadTheme();
+  }, [loadTheme]);
+
+  useEffect(() => {
+    const resolved = resolveTheme(theme);
+    applyTheme(resolved);
+    setResolvedTheme(resolved);
+    if (theme !== "system") {
+      return;
+    }
+    return subscribeSystemTheme((systemResolved) => {
+      applyTheme(systemResolved);
+      setResolvedTheme(systemResolved);
+    });
+  }, [theme, setResolvedTheme]);
+}
 
 function App() {
+  useTheme();
+  const loadDefaultModel = useAppStore((state) => state.loadDefaultModel);
+
+  useEffect(() => {
+    void loadDefaultModel();
+  }, [loadDefaultModel]);
+
   return (
     <HashRouter>
       <Routes>

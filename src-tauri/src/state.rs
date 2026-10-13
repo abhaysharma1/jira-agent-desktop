@@ -16,6 +16,12 @@ pub struct AgentRuntime {
     pub cost: f64,
     pub model: Option<String>,
     pub server: ManagedServer,
+    /// Failure callback, shared with the event-listener thread so a stuck or
+    /// looping agent can be aborted and the owning task marked failed even if
+    /// the blocking prompt is still waiting on the server.
+    pub failure_handler: std::sync::Arc<crate::opencode::PromptCallbacks>,
+    /// Monotonic timestamp of the last agent event; drives the stall watchdog.
+    pub last_activity: std::time::Instant,
 }
 
 pub struct AppState {
@@ -38,7 +44,7 @@ impl AppState {
     /// real credential store).
     pub fn load_with_key_source(data_dir: PathBuf, source: KeySource) -> Result<Self, String> {
         std::fs::create_dir_all(&data_dir).map_err(|error| error.to_string())?;
-        let connection = crate::db::open(&data_dir.join("jira-agent.db"))?;
+        let connection = crate::db::open(&data_dir.join("ticketbridge.db"))?;
         let _ = crate::db::import_json_if_empty(&connection, &data_dir);
         crate::db::recover_interrupted(&connection)?;
         let secure_store = match source {

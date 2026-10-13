@@ -41,9 +41,9 @@ pub fn build_implementation_prompt(ticket: &TicketInput, plan: &PlanContent) -> 
     };
 
     format!(
-        "You are implementing JIRA ticket {key}: {title}.\n\n\
-JIRA TICKET\n\
-===========\n\
+        "You are implementing ticket {key}: {title}.\n\n\
+TICKET\n\
+======\n\
 {description}\n\n\
 APPROVED IMPLEMENTATION PLAN\n\
 ============================\n\

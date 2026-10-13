@@ -8,7 +8,7 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 
 const KEY_FILE: &str = "credentials.key";
-const KEYRING_SERVICE: &str = "com.abhay.jira-agent-desktop";
+const KEYRING_SERVICE: &str = "com.abhay.ticketbridge";
 const KEY_LEN: usize = 32;
 
 /// Where the AES key itself is kept.
@@ -135,7 +135,11 @@ impl SecureStore {
         let ciphertext = cipher
             .encrypt(&nonce, plaintext.as_bytes())
             .map_err(|_| "encryption failed".to_string())?;
-        Ok(format!("v1:{}:{}", B64.encode(nonce), B64.encode(ciphertext)))
+        Ok(format!(
+            "v1:{}:{}",
+            B64.encode(nonce),
+            B64.encode(ciphertext)
+        ))
     }
 
     pub fn decrypt(&self, envelope: &str) -> Result<String, String> {
@@ -144,8 +148,12 @@ impl SecureStore {
         if version != "v1" {
             return Err("unsupported credential format".to_string());
         }
-        let nonce = parts.next().ok_or_else(|| "malformed credential".to_string())?;
-        let body = parts.next().ok_or_else(|| "malformed credential".to_string())?;
+        let nonce = parts
+            .next()
+            .ok_or_else(|| "malformed credential".to_string())?;
+        let body = parts
+            .next()
+            .ok_or_else(|| "malformed credential".to_string())?;
         let nonce = B64
             .decode(nonce)
             .map_err(|_| "malformed credential nonce".to_string())?;

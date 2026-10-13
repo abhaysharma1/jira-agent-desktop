@@ -49,7 +49,7 @@ pub fn start_agent(
     let selected_model = model
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| opencode::models::DEFAULT_MODEL.to_string());
+        .unwrap_or_else(|| super::settings::resolve_default_model(state.inner()));
     let config = opencode::models::inline_config(&selected_model);
 
     let (server, session_id) = opencode::run_blocking(move || {
@@ -143,16 +143,14 @@ pub fn send_agent_message(
         )
     };
 
-    opencode::spawn_prompt(app, run_id, base_url, password, session_id, content, agent, None);
+    opencode::spawn_prompt(
+        app, run_id, base_url, password, session_id, content, agent, None,
+    );
     Ok(())
 }
 
 #[tauri::command]
-pub fn stop_agent(
-    app: AppHandle,
-    state: State<AppState>,
-    run_id: String,
-) -> Result<(), String> {
+pub fn stop_agent(app: AppHandle, state: State<AppState>, run_id: String) -> Result<(), String> {
     let runtime = state
         .agents
         .lock()
@@ -186,10 +184,7 @@ pub fn stop_agent(
 }
 
 #[tauri::command]
-pub fn get_agent_status(
-    state: State<AppState>,
-    run_id: String,
-) -> Result<AgentRunView, String> {
+pub fn get_agent_status(state: State<AppState>, run_id: String) -> Result<AgentRunView, String> {
     let agents = state.agents.lock().map_err(|error| error.to_string())?;
     let runtime = agents
         .get(&run_id)

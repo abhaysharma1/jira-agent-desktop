@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use crate::cloud::CloudClient;
 use crate::db;
 use crate::domain::{
     JiraConnectionInfo, JiraIssue, JiraProjectRepo, JiraStatusMap, JiraSync, JiraTransition,
+    TicketSource,
 };
 use crate::jira::{JiraClient, WEBHOOK_EVENTS};
 use crate::oauth::{self, OAuthConfig};
@@ -18,6 +20,8 @@ const KEY_TOKENS: &str = "jiraOAuthTokens";
 const KEY_STATUS_MAP: &str = "jiraStatusMap";
 const KEY_WEBHOOK_URL: &str = "jiraWebhookUrl";
 const KEY_WEBHOOK_IDS: &str = "jiraWebhookIds";
+const KEY_CLIENT_ID: &str = "jiraClientId";
+const KEY_CLIENT_SECRET: &str = "jiraClientSecret";
 const KEY_CLOUD_BASE_URL: &str = "cloudBaseUrl";
 const KEY_CLOUD_TOKEN: &str = "cloudToken";
 const OAUTH_FILE: &str = "jira-oauth.json";
@@ -43,41 +47,83 @@ struct StoredTokens {
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn oauth_config(state: &AppState) -> Result<OAuthConfig, String> {
-    if let Some(client_id) = env_nonempty("JIRA_CLIENT_ID") {
-        return Ok(OAuthConfig::new(
-            client_id,
-            env_nonempty("JIRA_CLIENT_SECRET"),
-        ));
+    let env_client_id = env_nonempty("JIRA_CLIENT_ID");
+    let env_client_secret = env_nonempty("JIRA_CLIENT_SECRET");
+    let stored = stored_oauth_credentials(state);
+    let file = read_oauth_file(&state.data_dir.join(OAUTH_FILE))?;
+    match resolve_oauth_credentials(env_client_id, env_client_secret, stored, file) {
+        Some((client_id, client_secret)) => Ok(OAuthConfig::new(client_id, client_secret)),
+        None => Err(
+            "JIRA OAuth is not configured. Enter your Atlassian app Client ID and secret, set \
+             JIRA_CLIENT_ID (and JIRA_CLIENT_SECRET), or create ~/.ticketbridge/jira-oauth.json. \
+             See docs/phase-20-jira-oauth.md."
+                .to_string(),
+        ),
     }
-    let path = state.data_dir.join(OAUTH_FILE);
-    if path.exists() {
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|error| format!("read {OAUTH_FILE}: {error}"))?;
-        let value: Value = serde_json::from_str(&raw)
-            .map_err(|error| format!("invalid {OAUTH_FILE}: {error}"))?;
-        let client_id = value
-            .get("clientId")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("{OAUTH_FILE} is missing clientId"))?
-            .to_string();
-        let client_secret = value
-            .get("clientSecret")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string);
-        return Ok(OAuthConfig::new(client_id, client_secret));
+}
+
+/// Client id/secret entered in-app and stored encrypted, if any.
+fn stored_oauth_credentials(state: &AppState) -> (Option<String>, Option<String>) {
+    let client_id = crate::secrets::get(state, KEY_CLIENT_ID).ok().flatten();
+    let client_secret = crate::secrets::get(state, KEY_CLIENT_SECRET).ok().flatten();
+    (client_id, client_secret)
+}
+
+/// Reads the developer config file. `Ok(None)` when the file is absent; an error
+/// when it exists but cannot be parsed or is missing `clientId`.
+fn read_oauth_file(path: &Path) -> Result<Option<(String, Option<String>)>, String> {
+    if !path.exists() {
+        return Ok(None);
     }
-    Err(
-        "JIRA OAuth is not configured. Set JIRA_CLIENT_ID (and JIRA_CLIENT_SECRET), or create \
-         ~/.jira-agent/jira-oauth.json with {\"clientId\": \"...\", \"clientSecret\": \"...\"}. \
-         See docs/phase-20-jira-oauth.md."
-            .to_string(),
-    )
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let value: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let client_id = value
+        .get("clientId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("{} is missing clientId", path.display()))?
+        .to_string();
+    let client_secret = value
+        .get("clientSecret")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    Ok(Some((client_id, client_secret)))
+}
+
+/// Picks the effective OAuth credentials. Precedence: an explicit environment
+/// override, then credentials entered in-app (secure store), then the developer
+/// config file.
+fn resolve_oauth_credentials(
+    env_client_id: Option<String>,
+    env_client_secret: Option<String>,
+    stored: (Option<String>, Option<String>),
+    file: Option<(String, Option<String>)>,
+) -> Option<(String, Option<String>)> {
+    if let Some(client_id) = env_client_id {
+        return Some((client_id, env_client_secret));
+    }
+    let (stored_id, stored_secret) = stored;
+    if let Some(client_id) = stored_id {
+        return Some((client_id, stored_secret));
+    }
+    file
+}
+
+/// Whether OAuth client credentials are available from any source.
+pub fn oauth_configured(state: &AppState) -> bool {
+    if env_nonempty("JIRA_CLIENT_ID").is_some() || stored_oauth_credentials(state).0.is_some() {
+        return true;
+    }
+    state.data_dir.join(OAUTH_FILE).exists()
 }
 
 fn secure_store(state: &AppState) -> &SecureStore {
@@ -92,8 +138,8 @@ fn setting_string(state: &AppState, key: &str) -> Result<Option<String>, String>
 }
 
 fn load_tokens(state: &AppState) -> Result<StoredTokens, String> {
-    let envelope = setting_string(state, KEY_TOKENS)?
-        .ok_or_else(|| "JIRA is not connected".to_string())?;
+    let envelope =
+        setting_string(state, KEY_TOKENS)?.ok_or_else(|| "JIRA is not connected".to_string())?;
     let json = secure_store(state).decrypt(&envelope)?;
     serde_json::from_str(&json).map_err(|error| format!("invalid stored JIRA credentials: {error}"))
 }
@@ -121,9 +167,7 @@ fn connection_info(state: &AppState) -> Result<Option<JiraConnectionInfo>, Strin
 }
 
 fn expires_at_from(expires_in: Option<i64>) -> Option<String> {
-    expires_in.map(|seconds| {
-        (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339()
-    })
+    expires_in.map(|seconds| (chrono::Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339())
 }
 
 fn token_expired(tokens: &StoredTokens) -> bool {
@@ -166,7 +210,10 @@ fn access_tokens(state: &AppState) -> Result<(StoredTokens, OAuthConfig), String
 
 pub(crate) fn jira_client(state: &AppState) -> Result<JiraClient, String> {
     let (tokens, _config) = access_tokens(state)?;
-    Ok(JiraClient::for_cloud(&tokens.cloud_id, tokens.access_token)?.with_site_url(tokens.site_url))
+    Ok(
+        JiraClient::for_cloud(&tokens.cloud_id, tokens.access_token)?
+            .with_site_url(tokens.site_url),
+    )
 }
 
 pub fn is_connected(state: &AppState) -> bool {
@@ -240,6 +287,41 @@ pub fn start_jira_oauth(
     }
 
     connection_info(&state)?.ok_or_else(|| "JIRA connection was not saved".to_string())
+}
+
+#[tauri::command]
+pub fn jira_oauth_configured(state: State<AppState>) -> bool {
+    oauth_configured(&state)
+}
+
+/// Stores the Atlassian app Client ID/secret in the encrypted settings, so the
+/// user can paste them in-app instead of editing an environment or JSON file.
+#[tauri::command]
+pub fn set_jira_oauth_credentials(
+    state: State<AppState>,
+    client_id: String,
+    client_secret: String,
+) -> Result<(), String> {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        return Err("a JIRA client ID is required".to_string());
+    }
+    crate::secrets::set(&state, KEY_CLIENT_ID, client_id)?;
+
+    let client_secret = client_secret.trim();
+    if client_secret.is_empty() {
+        crate::secrets::delete(&state, KEY_CLIENT_SECRET)?;
+    } else {
+        crate::secrets::set(&state, KEY_CLIENT_SECRET, client_secret)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_jira_oauth_credentials(state: State<AppState>) -> Result<(), String> {
+    crate::secrets::delete(&state, KEY_CLIENT_ID)?;
+    crate::secrets::delete(&state, KEY_CLIENT_SECRET)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -336,6 +418,32 @@ pub fn get_jira_issue(state: State<AppState>, key: String) -> Result<JiraIssue, 
     jira_client(&state)?.get_issue(&key)
 }
 
+/// JQL for the Task page ticket picker. With no query it lists the current
+/// user's issues (most recently updated first); a non-empty query does a
+/// free-text match across issues the user can see.
+fn build_search_jql(query: &str) -> String {
+    let query = query.trim();
+    if query.is_empty() {
+        "assignee = currentUser() ORDER BY updated DESC".to_string()
+    } else {
+        let escaped = query.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("text ~ \"{escaped}\" ORDER BY updated DESC")
+    }
+}
+
+/// Searches JIRA so the user can pick a ticket by name. Results carry the key
+/// and summary (title); the UI renders them as `KEY - Title`.
+#[tauri::command]
+pub fn search_jira_issues(
+    state: State<AppState>,
+    query: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<JiraIssue>, String> {
+    let jql = build_search_jql(query.as_deref().unwrap_or_default());
+    let limit = limit.unwrap_or(20);
+    jira_client(&state)?.search_issues(&jql, limit)
+}
+
 #[tauri::command]
 pub fn list_jira_transitions(
     state: State<AppState>,
@@ -369,6 +477,10 @@ pub fn sync_task(app: &AppHandle, task_id: &str) -> Result<JiraSync, String> {
         (task, existing, pr)
     };
 
+    if task.ticket_source == TicketSource::Custom {
+        return Err("this task was created without a JIRA ticket".to_string());
+    }
+
     let key = task.jira_issue_key.clone();
     if key.trim().is_empty() {
         return Err("task has no JIRA issue key".to_string());
@@ -396,8 +508,7 @@ pub fn sync_task(app: &AppHandle, task_id: &str) -> Result<JiraSync, String> {
 
     if let Some(target) = map.opened.clone().filter(|value| !value.trim().is_empty()) {
         if !issue.status.eq_ignore_ascii_case(&target) {
-            let (cloud_id, access, site_url) =
-                (cloud_id.clone(), access.clone(), site_url.clone());
+            let (cloud_id, access, site_url) = (cloud_id.clone(), access.clone(), site_url.clone());
             let key = key.clone();
             let target_move = target.clone();
             let moved = crate::opencode::run_blocking(move || {
@@ -414,10 +525,10 @@ pub fn sync_task(app: &AppHandle, task_id: &str) -> Result<JiraSync, String> {
 
     let comment = match &pr {
         Some(pr) => format!(
-            "JIRA Agent opened pull request #{}: {}",
+            "TicketBridge opened pull request #{}: {}",
             pr.number, pr.url
         ),
-        None => "JIRA Agent completed the implementation.".to_string(),
+        None => "TicketBridge completed the implementation.".to_string(),
     };
     {
         let (cloud_id, access, site_url) = (cloud_id.clone(), access.clone(), site_url.clone());
@@ -478,10 +589,115 @@ pub fn set_jira_project_repo(
 }
 
 #[tauri::command]
-pub fn delete_jira_project_repo(
-    state: State<AppState>,
-    project_key: String,
-) -> Result<(), String> {
+pub fn delete_jira_project_repo(state: State<AppState>, project_key: String) -> Result<(), String> {
     let connection = state.db.lock().map_err(|error| error.to_string())?;
     db::delete_jira_project_repo(&connection, project_key.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_ticket_picker_jql() {
+        assert_eq!(
+            build_search_jql(""),
+            "assignee = currentUser() ORDER BY updated DESC"
+        );
+        assert_eq!(
+            build_search_jql("   "),
+            "assignee = currentUser() ORDER BY updated DESC"
+        );
+        assert_eq!(
+            build_search_jql("login bug"),
+            "text ~ \"login bug\" ORDER BY updated DESC"
+        );
+        assert_eq!(
+            build_search_jql("say \"hi\""),
+            "text ~ \"say \\\"hi\\\"\" ORDER BY updated DESC"
+        );
+    }
+
+    fn stored(id: &str, secret: &str) -> (Option<String>, Option<String>) {
+        (Some(id.to_string()), Some(secret.to_string()))
+    }
+
+    fn file(id: &str, secret: &str) -> Option<(String, Option<String>)> {
+        Some((id.to_string(), Some(secret.to_string())))
+    }
+
+    #[test]
+    fn env_credentials_win_over_stored_and_file() {
+        let resolved = resolve_oauth_credentials(
+            Some("env-id".to_string()),
+            Some("env-secret".to_string()),
+            stored("stored-id", "stored-secret"),
+            file("file-id", "file-secret"),
+        );
+        assert_eq!(
+            resolved,
+            Some(("env-id".to_string(), Some("env-secret".to_string())))
+        );
+    }
+
+    #[test]
+    fn stored_credentials_win_over_file() {
+        let resolved = resolve_oauth_credentials(
+            None,
+            None,
+            stored("stored-id", "stored-secret"),
+            file("file-id", "file-secret"),
+        );
+        assert_eq!(
+            resolved,
+            Some(("stored-id".to_string(), Some("stored-secret".to_string())))
+        );
+    }
+
+    #[test]
+    fn file_is_the_last_resort() {
+        let resolved = resolve_oauth_credentials(None, None, (None, None), file("file-id", "s"));
+        assert_eq!(
+            resolved,
+            Some(("file-id".to_string(), Some("s".to_string())))
+        );
+    }
+
+    #[test]
+    fn no_sources_means_unconfigured() {
+        assert_eq!(
+            resolve_oauth_credentials(None, None, (None, None), None),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_and_rejects_the_oauth_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("jira-oauth.json");
+        assert_eq!(read_oauth_file(&missing).unwrap(), None);
+
+        let valid = dir.path().join("valid.json");
+        std::fs::write(&valid, r#"{"clientId":"id-1","clientSecret":"secret-1"}"#).unwrap();
+        assert_eq!(
+            read_oauth_file(&valid).unwrap(),
+            Some(("id-1".to_string(), Some("secret-1".to_string())))
+        );
+
+        let id_only = dir.path().join("id-only.json");
+        std::fs::write(&id_only, r#"{"clientId":"id-2"}"#).unwrap();
+        assert_eq!(
+            read_oauth_file(&id_only).unwrap(),
+            Some(("id-2".to_string(), None))
+        );
+
+        let malformed = dir.path().join("malformed.json");
+        std::fs::write(&malformed, "not json").unwrap();
+        assert!(read_oauth_file(&malformed).is_err());
+
+        let no_id = dir.path().join("no-id.json");
+        std::fs::write(&no_id, r#"{"clientSecret":"secret"}"#).unwrap();
+        assert!(read_oauth_file(&no_id).is_err());
+    }
 }

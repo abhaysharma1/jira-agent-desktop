@@ -37,7 +37,7 @@ pub fn running_text(running: u32) -> String {
 /// Builds the tray icon and menu. Must run after `AppState` is managed, since
 /// the menu actions need the state handle.
 pub fn build(app: &AppHandle) -> tauri::Result<()> {
-    let title = MenuItem::with_id(app, "title", "JIRA Agent", false, None::<&str>)?;
+    let title = MenuItem::with_id(app, "title", "TicketBridge", false, None::<&str>)?;
     let pending = MenuItem::with_id(app, "stats", pending_text(0), false, None::<&str>)?;
     let running = MenuItem::with_id(app, "runs", running_text(0), false, None::<&str>)?;
     let separator_one = PredefinedMenuItem::separator(app)?;
@@ -63,7 +63,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .tooltip("JIRA Agent")
+        .tooltip("TicketBridge")
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_main(app),
             "settings" => {

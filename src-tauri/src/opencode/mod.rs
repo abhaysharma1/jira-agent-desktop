@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -68,8 +69,7 @@ where
 }
 
 pub fn free_port() -> Result<u16, String> {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|error| error.to_string())?;
     let port = listener
         .local_addr()
         .map_err(|error| error.to_string())?
@@ -157,22 +157,63 @@ fn parse_npm_shim(shim: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Total time allowed for short control-plane calls (health, provider list,
+/// session create, abort, permission replies). Agent prompts deliberately do
+/// not use this value.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// If the agent emits no events for this long it is considered stuck and the
+/// session is aborted. Generous on purpose: a long-running test/build command
+/// is quiet while it executes and must not be cut off.
+const STALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Running the exact same shell command this many times in a row is treated as
+/// a doom loop (e.g. re-running a failing test command without converging).
+const LOOP_REPEAT_LIMIT: u32 = 6;
+
 pub struct OpenCodeClient {
     base_url: String,
     password: String,
     http: reqwest::blocking::Client,
+    /// Dedicated client for `prompt`. It is deliberately built with NO total
+    /// request timeout: a single agent turn can run far longer than a control
+    /// call while it implements changes and runs the repository's test suite.
+    /// reqwest's client builder silently defaults to a 30-second total timeout
+    /// (`Timeout::default()` in reqwest 0.12), which is what actually killed
+    /// planning/implementation prompts at ~30s; `timeout(None)` removes that
+    /// cap. Progress arrives over the event stream, and a stuck turn is aborted
+    /// by the stall/loop watchdog rather than a clock.
+    prompt_http: reqwest::blocking::Client,
 }
 
 impl OpenCodeClient {
     pub fn new(base_url: String, password: String) -> Self {
         let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .timeout(CONTROL_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        // The prompt client must never carry reqwest's default 30s total
+        // timeout (see the field docs). The connect-timeout only bounds the
+        // TCP handshake so a dead/black-holed server fails fast; it does not
+        // cap the prompt duration.
+        let prompt_http = reqwest::blocking::Client::builder()
+            .timeout(None)
+            .connect_timeout(Some(Duration::from_secs(10)))
+            .build()
+            .unwrap_or_else(|_| {
+                // The build above only fails when no usable connector exists
+                // (e.g. a missing TLS backend). Dropping the connect-timeout
+                // still yields a fully timeout-free client, which is the point.
+                reqwest::blocking::Client::builder()
+                    .timeout(None)
+                    .build()
+                    .expect("timeout(None) client build cannot fail")
+            });
         Self {
             base_url,
             password,
             http,
+            prompt_http,
         }
     }
 
@@ -258,26 +299,26 @@ impl OpenCodeClient {
         format: Option<&Value>,
     ) -> Result<Value, String> {
         let response = self
-            .post(&format!("/session/{session_id}/message"))
+            .prompt_http
+            .post(format!("{}/session/{session_id}/message", self.base_url))
+            .basic_auth("opencode", Some(&self.password))
             .json(&build_prompt_body(text, agent, model, format))
             .send()
-            .map_err(|error| format!("prompt failed: {error}"))?;
+            .map_err(|error| describe_prompt_error(&error))?;
         if !response.status().is_success() {
             return Err(format!(
                 "prompt returned {}: {}",
                 response.status(),
-                response.text().unwrap_or_default()
+                bounded_response_body(response)
             ));
         }
         response
             .json()
-            .map_err(|error| format!("invalid prompt response: {error}"))
+            .map_err(|error| describe_prompt_error(&error))
     }
 
     pub fn abort(&self, session_id: &str) {
-        let _ = self
-            .post(&format!("/session/{session_id}/abort"))
-            .send();
+        let _ = self.post(&format!("/session/{session_id}/abort")).send();
     }
 
     pub fn respond_permission(&self, session_id: &str, permission_id: &str, response: &str) {
@@ -291,6 +332,11 @@ impl OpenCodeClient {
 
     pub fn event_response(&self) -> Result<reqwest::blocking::Response, String> {
         let http = reqwest::blocking::Client::builder()
+            // Same silent 30s default as the prompt client: a quiet tool
+            // execution (a long build or test run) emits no SSE frames, and a
+            // read that blocks for 30s must not kill the event stream.
+            .timeout(None)
+            .connect_timeout(Some(Duration::from_secs(10)))
             .build()
             .map_err(|error| error.to_string())?;
         http.get(format!("{}/event", self.base_url))
@@ -403,7 +449,7 @@ pub fn start_server(
                 }),
             );
             return Err(
-                "timed out waiting for the opencode server to start; see ~/.jira-agent/logs"
+                "timed out waiting for the opencode server to start; see ~/.ticketbridge/logs"
                     .to_string(),
             );
         }
@@ -472,6 +518,8 @@ pub struct EventMapper {
     run_id: String,
     part_text: HashMap<String, String>,
     tool_status: HashMap<String, String>,
+    last_bash_command: Option<String>,
+    bash_repeat_count: u32,
 }
 
 impl EventMapper {
@@ -480,11 +528,27 @@ impl EventMapper {
             run_id,
             part_text: HashMap::new(),
             tool_status: HashMap::new(),
+            last_bash_command: None,
+            bash_repeat_count: 0,
         }
     }
 
     pub fn run_id(&self) -> &str {
         &self.run_id
+    }
+
+    /// A human-readable reason the agent is considered stuck in a loop, if the
+    /// same shell command has just been repeated enough times in a row.
+    pub fn loop_reason(&self) -> Option<String> {
+        if self.bash_repeat_count >= LOOP_REPEAT_LIMIT {
+            Some(format!(
+                "the agent ran `{}` {} times in a row and appears stuck in a loop",
+                self.last_bash_command.as_deref().unwrap_or(""),
+                self.bash_repeat_count
+            ))
+        } else {
+            None
+        }
     }
 
     pub fn feed(&mut self, value: &Value) -> Vec<AgentEvent> {
@@ -494,12 +558,12 @@ impl EventMapper {
         };
         let properties = value.get("properties");
         match event_type {
-            "message.part.updated" | "message.part.created" => match properties
-                .and_then(|properties| properties.get("part"))
-            {
-                Some(part) => self.map_part(part),
-                None => Vec::new(),
-            },
+            "message.part.updated" | "message.part.created" => {
+                match properties.and_then(|properties| properties.get("part")) {
+                    Some(part) => self.map_part(part),
+                    None => Vec::new(),
+                }
+            }
             "file.edited" => properties
                 .and_then(|properties| properties.get("file"))
                 .and_then(Value::as_str)
@@ -656,10 +720,20 @@ impl EventMapper {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                if finished && !command.is_empty() {
+                    if self.last_bash_command.as_deref() == Some(command.as_str()) {
+                        self.bash_repeat_count += 1;
+                    } else {
+                        self.last_bash_command = Some(command.clone());
+                        self.bash_repeat_count = 1;
+                    }
+                }
                 if finished {
                     let exit_code = state
                         .and_then(|state| state.get("metadata"))
-                        .and_then(|metadata| metadata.get("exit").or_else(|| metadata.get("exitCode")))
+                        .and_then(|metadata| {
+                            metadata.get("exit").or_else(|| metadata.get("exitCode"))
+                        })
                         .and_then(Value::as_i64)
                         .map(|value| value as i32)
                         .unwrap_or(if status == "error" { 1 } else { 0 });
@@ -753,6 +827,149 @@ fn truncate(value: &str, max: usize) -> String {
     }
 }
 
+/// How much of an HTTP error-response body is kept for the DB/UI error field.
+/// Error pages can be huge, and the response is not trusted input.
+const MAX_ERROR_BODY: usize = 2048;
+
+/// Builds an actionable, redacted one-line error for a failed prompt request
+/// (connection refused / reset / request timeout / response timeout / premature
+/// termination / server exit / HTTP error / provider error / cancellation is
+/// handled by the stall watchdog, not reqwest). Request bodies, credentials and
+/// auth headers are never included; the underlying error chain is bounded.
+fn describe_prompt_error(error: &reqwest::Error) -> String {
+    let url = error
+        .url()
+        .map(|url| format!(" for url ({url})"))
+        .unwrap_or_default();
+    let chains = error_chain(error);
+    let category = classify_prompt_failure(
+        error.is_connect(),
+        error.is_timeout(),
+        error.is_body(),
+        error.is_decode(),
+        &chains,
+    );
+    format!(
+        "prompt failed: {category}{url} [{}]",
+        summarize_chain(&chains)
+    )
+}
+
+/// The immediate and underlying error messages for a reqwest failure, in order.
+fn error_chain(error: &reqwest::Error) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut next = error.source();
+    while let Some(source) = next {
+        lines.push(source.to_string());
+        next = source.source();
+    }
+    lines
+}
+
+/// Picks a single human-readable category for a failed request based on
+/// reqwest's error predicates and the underlying error chain. Pure so it can be
+/// unit-tested with representative chains from every platform.
+fn classify_prompt_failure(
+    is_connect: bool,
+    is_timeout: bool,
+    is_body: bool,
+    is_decode: bool,
+    chains: &[String],
+) -> &'static str {
+    let mentions = |needles: &[&str]| {
+        chains.iter().any(|line| {
+            let lower = line.to_ascii_lowercase();
+            needles.iter().any(|needle| lower.contains(needle))
+        })
+    };
+
+    if is_timeout {
+        if mentions(&["connect"]) {
+            "timed out while connecting to the opencode server"
+        } else {
+            "timed out waiting for the opencode response"
+        }
+    } else if is_connect {
+        if mentions(&["refused"]) {
+            "connection refused by the opencode server"
+        } else if mentions(&["reset", "forcibly closed"]) {
+            "connection reset while connecting to the opencode server"
+        } else {
+            "could not connect to the opencode server"
+        }
+    } else if mentions(&[
+        "forcibly closed",
+        "reset by peer",
+        "connection reset",
+        "broken pipe",
+        "unexpected eof",
+        "unexpected end of file",
+        "end of file before message",
+        "closed before message completed",
+        "channel closed",
+        "producer dropped",
+    ]) {
+        "the opencode server terminated the connection before the response completed (the server process likely crashed or was killed)"
+    } else if is_body {
+        "the response body could not be read from the opencode server"
+    } else if is_decode {
+        "the opencode server returned an unparseable response body"
+    } else {
+        "the opencode request failed"
+    }
+}
+
+/// At most three chain entries, each truncated, so DB/UI error fields stay small.
+fn summarize_chain(chains: &[String]) -> String {
+    if chains.is_empty() {
+        return "no underlying detail".to_string();
+    }
+    chains
+        .iter()
+        .take(3)
+        .map(|line| {
+            let mut line = line.clone();
+            if line.chars().count() > 200 {
+                line = line.chars().take(200).collect::<String>() + "…";
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Reads at most `MAX_ERROR_BODY` bytes of an HTTP error response body and
+/// redacts anything that looks like a credential before it reaches the error
+/// string stored in the database.
+fn bounded_response_body(mut response: reqwest::blocking::Response) -> String {
+    use std::io::Read;
+    let mut buffer = [0u8; 1024];
+    let mut body = String::new();
+    loop {
+        match response.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                body.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                if body.len() >= MAX_ERROR_BODY {
+                    body.truncate(MAX_ERROR_BODY);
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let truncated = body.len() >= MAX_ERROR_BODY;
+    let body = crate::logging::redact_secrets(&body);
+    if body.is_empty() {
+        return String::new();
+    }
+    if truncated {
+        format!("{body}\n…(body truncated to {MAX_ERROR_BODY} bytes)")
+    } else {
+        body
+    }
+}
+
 pub fn spawn_event_listener(
     app: AppHandle,
     run_id: String,
@@ -760,6 +977,13 @@ pub fn spawn_event_listener(
     password: String,
     session_id: String,
 ) {
+    spawn_stall_watchdog(
+        app.clone(),
+        run_id.clone(),
+        base_url.clone(),
+        password.clone(),
+        session_id.clone(),
+    );
     std::thread::spawn(move || {
         let client = OpenCodeClient::new(base_url, password);
         let mut mapper = EventMapper::new(run_id);
@@ -785,6 +1009,48 @@ pub fn spawn_event_listener(
                 Err(_) => continue,
             };
             handle_event(&app, &client, &mut mapper, &session_id, &value);
+        }
+    });
+}
+
+/// Watches a run for total inactivity. If the agent emits no events for
+/// `STALL_TIMEOUT`, the session is aborted and the run failed. A long-running
+/// shell command is quiet while it executes, so the timeout is deliberately
+/// generous.
+fn spawn_stall_watchdog(
+    app: AppHandle,
+    run_id: String,
+    base_url: String,
+    password: String,
+    session_id: String,
+) {
+    std::thread::spawn(move || {
+        let client = OpenCodeClient::new(base_url, password);
+        loop {
+            std::thread::sleep(Duration::from_secs(15));
+            let stalled = {
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
+                let Ok(agents) = state.agents.lock() else {
+                    return;
+                };
+                let Some(runtime) = agents.get(&run_id) else {
+                    return;
+                };
+                if runtime.run.completed_at.is_some() {
+                    return;
+                }
+                runtime.last_activity.elapsed() >= STALL_TIMEOUT
+            };
+            if stalled {
+                let reason = format!(
+                    "no agent activity for {} minutes; aborting a stuck turn",
+                    STALL_TIMEOUT.as_secs() / 60
+                );
+                stuck_abort(&app, &client, &run_id, &session_id, &reason);
+                return;
+            }
         }
     });
 }
@@ -845,12 +1111,16 @@ fn handle_event(
             }
         }
     }
+
+    if let Some(reason) = mapper.loop_reason() {
+        stuck_abort(app, client, mapper.run_id(), session_id, &reason);
+    }
 }
 
 #[derive(Default)]
 pub struct PromptCallbacks {
-    pub on_success: Option<Box<dyn FnOnce(&AppHandle, &Value) + Send>>,
-    pub on_failure: Option<Box<dyn FnOnce(&AppHandle, &str) + Send>>,
+    pub on_success: Option<Box<dyn Fn(&AppHandle, &Value) + Send + Sync>>,
+    pub on_failure: Option<Box<dyn Fn(&AppHandle, &str) + Send + Sync>>,
 }
 
 pub fn spawn_prompt(
@@ -890,6 +1160,17 @@ pub fn spawn_prompt_with(
     format: Option<Value>,
     callbacks: PromptCallbacks,
 ) {
+    let callbacks = std::sync::Arc::new(callbacks);
+    // Hand the failure handler to the event-listener thread so a stuck/looping
+    // agent can be aborted and the owning task marked failed with a clear
+    // message, even if the blocking prompt below is still waiting on the server.
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut agents) = state.agents.lock() {
+            if let Some(runtime) = agents.get_mut(&run_id) {
+                runtime.failure_handler = callbacks.clone();
+            }
+        }
+    }
     std::thread::spawn(move || {
         let client = OpenCodeClient::new(base_url, password);
         set_status(&app, &run_id, AgentRunStatus::Running);
@@ -901,16 +1182,21 @@ pub fn spawn_prompt_with(
             format.as_ref(),
         ) {
             Ok(value) => {
-                if let Some(on_success) = callbacks.on_success {
-                    on_success(&app, &value);
+                // Only run the success callback if this call actually finalized
+                // the run; the event-listener loop guard may have failed it
+                // first.
+                if finish_success(&app, &run_id, &value) {
+                    if let Some(on_success) = callbacks.on_success.as_ref() {
+                        on_success(&app, &value);
+                    }
                 }
-                finish_success(&app, &run_id, &value);
             }
             Err(error) => {
-                if let Some(on_failure) = callbacks.on_failure {
-                    on_failure(&app, &error);
+                if finish_failure(&app, &run_id, error.clone()) {
+                    if let Some(on_failure) = callbacks.on_failure.as_ref() {
+                        on_failure(&app, &error);
+                    }
                 }
-                finish_failure(&app, &run_id, error);
             }
         }
     });
@@ -948,16 +1234,14 @@ fn persist_run(app: &AppHandle, run_id: &str) {
         let Ok(agents) = state.agents.lock() else {
             return;
         };
-        agents
-            .get(run_id)
-            .map(|runtime| {
-                (
-                    runtime.run.clone(),
-                    runtime.output.clone(),
-                    runtime.cost,
-                    runtime.model.clone(),
-                )
-            })
+        agents.get(run_id).map(|runtime| {
+            (
+                runtime.run.clone(),
+                runtime.output.clone(),
+                runtime.cost,
+                runtime.model.clone(),
+            )
+        })
     };
     if let Some((run, output, cost, model)) = snapshot {
         if let Ok(connection) = state.db.lock() {
@@ -972,6 +1256,7 @@ fn push_event(app: &AppHandle, event: AgentEvent) {
             if let Ok(mut agents) = state.agents.lock() {
                 if let Some(runtime) = agents.get_mut(event.run_id()) {
                     runtime.events.push(event.clone());
+                    runtime.last_activity = std::time::Instant::now();
                 }
             }
         }
@@ -996,13 +1281,11 @@ fn set_status(app: &AppHandle, run_id: &str, status: AgentRunStatus) {
         }
         persist_run(app, run_id);
     }
-    let _ = app.emit(
-        AGENT_STATUS,
-        json!({ "runId": run_id, "status": status }),
-    );
+    let _ = app.emit(AGENT_STATUS, json!({ "runId": run_id, "status": status }));
 }
 
-fn finish_success(app: &AppHandle, run_id: &str, value: &Value) {
+/// Output text, cost, and model id extracted from a successful prompt response.
+fn success_details(value: &Value) -> (String, f64, Option<String>) {
     let output = extract_text(value);
     let info = value.get("info");
     let cost = info
@@ -1017,11 +1300,109 @@ fn finish_success(app: &AppHandle, run_id: &str, value: &Value) {
             _ => None,
         }
     });
-    finalize(app, run_id, output, cost, model, true, None);
+    (output, cost, model)
 }
 
-fn finish_failure(app: &AppHandle, run_id: &str, error: String) {
-    finalize(app, run_id, String::new(), 0.0, None, false, Some(error));
+fn finish_success(app: &AppHandle, run_id: &str, value: &Value) -> bool {
+    let (output, cost, model) = success_details(value);
+    finalize(app, run_id, output, cost, model, true, None)
+}
+
+fn finish_failure(app: &AppHandle, run_id: &str, error: String) -> bool {
+    finalize(app, run_id, String::new(), 0.0, None, false, Some(error))
+}
+
+fn run_finalized(app: &AppHandle, run_id: &str) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return true;
+    };
+    let agents = match state.agents.lock() {
+        Ok(agents) => agents,
+        Err(_) => return true,
+    };
+    agents
+        .get(run_id)
+        .map(|runtime| runtime.run.completed_at.is_some())
+        .unwrap_or(true)
+}
+
+/// Aborts a session the watchdog has flagged as stuck or looping, fails the run
+/// with a clear message, and — only if this call actually finalized the run —
+/// marks the owning task failed via the stored failure handler. Called from the
+/// event-listener and stall-watchdog threads.
+fn stuck_abort(
+    app: &AppHandle,
+    client: &OpenCodeClient,
+    run_id: &str,
+    session_id: &str,
+    reason: &str,
+) {
+    if run_finalized(app, run_id) {
+        return;
+    }
+    let handler = {
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        let Ok(agents) = state.agents.lock() else {
+            return;
+        };
+        let Some(runtime) = agents.get(run_id) else {
+            return;
+        };
+        runtime.failure_handler.clone()
+    };
+
+    crate::logging::warn(
+        "opencode",
+        "agent appeared stuck; aborting",
+        json!({ "runId": run_id, "reason": reason }),
+    );
+
+    client.abort(session_id);
+
+    if finish_failure(app, run_id, reason.to_string()) {
+        if let Some(on_failure) = handler.on_failure.as_ref() {
+            on_failure(app, reason);
+        }
+    }
+}
+
+/// Applies the exactly-once run-finalization state mutation. Returns false when
+/// the run has already been finalized — the event-listener loop guard may
+/// finalize an aborted/stuck run before the blocking prompt returns, and
+/// whichever thread gets there first wins. Stays state-level so the semantics
+/// are testable without a Tauri app handle.
+fn apply_finalize(
+    state: &AppState,
+    run_id: &str,
+    event: &AgentEvent,
+    timestamp: &str,
+    output: String,
+    cost: f64,
+    model: Option<String>,
+    success: bool,
+) -> bool {
+    let Ok(mut agents) = state.agents.lock() else {
+        return true;
+    };
+    let Some(runtime) = agents.get_mut(run_id) else {
+        return true;
+    };
+    if runtime.run.completed_at.is_some() {
+        return false;
+    }
+    runtime.events.push(event.clone());
+    runtime.run.completed_at = Some(timestamp.to_string());
+    runtime.cost = cost;
+    runtime.model = model;
+    if success {
+        runtime.output = output;
+        runtime.run.status = AgentRunStatus::Succeeded;
+    } else {
+        runtime.run.status = AgentRunStatus::Failed;
+    }
+    true
 }
 
 fn finalize(
@@ -1032,7 +1413,7 @@ fn finalize(
     model: Option<String>,
     success: bool,
     error: Option<String>,
-) {
+) -> bool {
     let timestamp = now();
     let error_message = error.unwrap_or_default();
     let event = if success {
@@ -1049,19 +1430,10 @@ fn finalize(
     };
 
     if let Some(state) = app.try_state::<AppState>() {
-        if let Ok(mut agents) = state.agents.lock() {
-            if let Some(runtime) = agents.get_mut(run_id) {
-                runtime.events.push(event.clone());
-                runtime.run.completed_at = Some(timestamp);
-                runtime.cost = cost;
-                runtime.model = model;
-                if success {
-                    runtime.output = output;
-                    runtime.run.status = AgentRunStatus::Succeeded;
-                } else {
-                    runtime.run.status = AgentRunStatus::Failed;
-                }
-            }
+        if !apply_finalize(
+            &state, run_id, &event, &timestamp, output, cost, model, success,
+        ) {
+            return false;
         }
         persist_run(app, run_id);
     }
@@ -1090,10 +1462,8 @@ fn finalize(
     } else {
         AgentRunStatus::Failed
     };
-    let _ = app.emit(
-        AGENT_STATUS,
-        json!({ "runId": run_id, "status": status }),
-    );
+    let _ = app.emit(AGENT_STATUS, json!({ "runId": run_id, "status": status }));
+    true
 }
 
 #[cfg(test)]
@@ -1163,12 +1533,16 @@ mod tests {
             "type": "message.part.updated",
             "properties": { "part": { "id": "p1", "type": "text", "text": "Hello" } }
         }));
-        assert!(matches!(first.first(), Some(AgentEvent::Message { content, .. }) if content == "Hello"));
+        assert!(
+            matches!(first.first(), Some(AgentEvent::Message { content, .. }) if content == "Hello")
+        );
         let second = mapper.feed(&json!({
             "type": "message.part.updated",
             "properties": { "part": { "id": "p1", "type": "text", "text": "Hello world" } }
         }));
-        assert!(matches!(second.first(), Some(AgentEvent::Message { content, .. }) if content == " world"));
+        assert!(
+            matches!(second.first(), Some(AgentEvent::Message { content, .. }) if content == " world")
+        );
         let third = mapper.feed(&json!({
             "type": "message.part.updated",
             "properties": { "part": { "id": "p1", "type": "text", "text": "Hello world" } }
@@ -1194,7 +1568,9 @@ mod tests {
             "properties": { "part": { "id": "t1", "type": "tool", "callID": "c1", "tool": "read",
                 "state": { "status": "running", "input": { "filePath": "src/app.ts" } } } }
         }));
-        assert!(matches!(events.first(), Some(AgentEvent::FileRead { path, .. }) if path == "src/app.ts"));
+        assert!(
+            matches!(events.first(), Some(AgentEvent::FileRead { path, .. }) if path == "src/app.ts")
+        );
     }
 
     #[test]
@@ -1205,7 +1581,9 @@ mod tests {
             "properties": { "part": { "id": "t1", "type": "tool", "callID": "c1", "tool": "bash",
                 "state": { "status": "running", "input": { "command": "npm test" } } } }
         }));
-        assert!(matches!(running.first(), Some(AgentEvent::CommandStarted { command, .. }) if command == "npm test"));
+        assert!(
+            matches!(running.first(), Some(AgentEvent::CommandStarted { command, .. }) if command == "npm test")
+        );
         let done = mapper.feed(&json!({
             "type": "message.part.updated",
             "properties": { "part": { "id": "t1", "type": "tool", "callID": "c1", "tool": "bash",
@@ -1213,7 +1591,9 @@ mod tests {
         }));
         let finished = done.first().expect("command finished");
         match finished {
-            AgentEvent::CommandFinished { exit_code, output, .. } => {
+            AgentEvent::CommandFinished {
+                exit_code, output, ..
+            } => {
                 assert_eq!(*exit_code, 0);
                 assert_eq!(output.as_deref(), Some("tests passed"));
             }
@@ -1239,6 +1619,34 @@ mod tests {
             events.first(),
             Some(AgentEvent::Tool { name, title, .. }) if name == "grep" && title == "Searching for auth"
         ));
+    }
+
+    #[test]
+    fn detects_repeated_command_loop() {
+        let mut mapper = EventMapper::new("run1".to_string());
+        for i in 0..LOOP_REPEAT_LIMIT {
+            mapper.feed(&json!({
+                "type": "message.part.updated",
+                "properties": { "part": { "id": format!("t{i}"), "type": "tool", "callID": format!("c{i}"),
+                    "tool": "bash", "state": { "status": "completed",
+                        "input": { "command": "npm test" }, "metadata": { "exit": 1 } } } }
+            }));
+        }
+        assert!(mapper.loop_reason().is_some());
+    }
+
+    #[test]
+    fn different_commands_reset_loop_counter() {
+        let mut mapper = EventMapper::new("run1".to_string());
+        for (i, command) in ["npm test", "npm run lint", "npm test"].iter().enumerate() {
+            mapper.feed(&json!({
+                "type": "message.part.updated",
+                "properties": { "part": { "id": format!("t{i}"), "type": "tool", "callID": format!("c{i}"),
+                    "tool": "bash", "state": { "status": "completed",
+                        "input": { "command": command } } } }
+            }));
+        }
+        assert!(mapper.loop_reason().is_none());
     }
 
     #[test]
@@ -1288,9 +1696,8 @@ mod tests {
         let program = resolve_program(DEFAULT_COMMAND).expect("opencode on PATH");
         let log_dir = temp.path().join("logs");
         let config = models::inline_config(models::DEFAULT_MODEL);
-        let mut server =
-            start_server(&program, &dir, &log_dir, READ_ONLY_PERMISSION, &config)
-                .expect("start server");
+        let mut server = start_server(&program, &dir, &log_dir, READ_ONLY_PERMISSION, &config)
+            .expect("start server");
         let client = server.client();
         let session = client
             .create_session("phase5-test")
@@ -1314,5 +1721,377 @@ mod tests {
         assert!(!text.trim().is_empty(), "expected a non-empty response");
         assert_eq!(cost, 0.0, "expected a free (zero-cost) run");
         server.stop(Some(&session));
+    }
+
+    // ------------------------------------------------------------------
+    // Mock-server scenarios for the prompt timeout / diagnostics fixes.
+    // A real opencode server or paid provider call is never involved.
+    // ------------------------------------------------------------------
+
+    use crate::commands::runtime::register_run;
+    use crate::state::AppState;
+    use crate::test_support::MockServer;
+
+    fn temp_state() -> (tempfile::TempDir, AppState) {
+        let temp = tempfile::tempdir().unwrap();
+        let state = AppState::load_with_key_source(
+            temp.path().to_path_buf(),
+            crate::secure_store::KeySource::File,
+        )
+        .unwrap();
+        (temp, state)
+    }
+
+    fn insert_run(state: &AppState, run_id: &str, status: AgentRunStatus) {
+        let run = crate::domain::AgentRun {
+            id: run_id.to_string(),
+            task_id: "task-1".to_string(),
+            mode: "implementation".to_string(),
+            agent: Some("build".to_string()),
+            status,
+            session_id: None,
+            started_at: "2026-10-10T00:00:00Z".to_string(),
+            completed_at: None,
+        };
+        register_run(
+            state,
+            run,
+            String::new(),
+            0.0,
+            None,
+            crate::test_support::dummy_managed_server(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn health_reports_version_and_rejects_errors() {
+        let server = MockServer::start(|request, _body| match request {
+            "GET /global/health" => (200, r#"{"version":"1.2.3"}"#.to_string()),
+            _ => (500, "boom".to_string()),
+        });
+        let client = OpenCodeClient::new(server.base_url(), "pw".to_string());
+        assert_eq!(client.health().unwrap(), "1.2.3");
+    }
+
+    #[test]
+    fn health_fails_clearly_when_server_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // nothing is listening any more: not ready
+        let client = OpenCodeClient::new(format!("http://{addr}"), "pw".to_string());
+        let error = client.health().unwrap_err();
+        assert!(error.contains("health request failed"), "got: {error}");
+    }
+
+    #[test]
+    fn prompt_success_records_output_cost_and_model() {
+        let server = MockServer::start(|request, _body| {
+            match request {
+            "POST /session/ses_1/message" => (
+                200,
+                r#"{"parts":[{"type":"text","text":"all done"}],"info":{"cost":0.5,"providerID":"opencode","modelID":"big-pickle"}}"#
+                    .to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        }
+        });
+        let client = OpenCodeClient::new(server.base_url(), "pw".to_string());
+        let value = client
+            .prompt("ses_1", "implement it", None, None, None)
+            .unwrap();
+
+        let (output, cost, model) = success_details(&value);
+        let (_temp, state) = temp_state();
+        insert_run(&state, "run-1", AgentRunStatus::Running);
+
+        let event = AgentEvent::Finished {
+            run_id: "run-1".to_string(),
+            timestamp: "2026-10-10T01:00:00Z".to_string(),
+        };
+        assert!(apply_finalize(
+            &state,
+            "run-1",
+            &event,
+            "2026-10-10T01:00:00Z",
+            output.clone(),
+            cost,
+            model.clone(),
+            true
+        ));
+
+        let agents = state.agents.lock().unwrap();
+        let runtime = &agents["run-1"];
+        assert_eq!(runtime.run.status, AgentRunStatus::Succeeded);
+        assert_eq!(runtime.output, "all done");
+        assert_eq!(runtime.cost, 0.5);
+        assert_eq!(runtime.model.as_deref(), Some("opencode/big-pickle"));
+        assert!(runtime.run.completed_at.is_some());
+        assert!(runtime
+            .events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Finished { .. })));
+    }
+
+    #[test]
+    fn finalize_runs_exactly_once() {
+        let (_temp, state) = temp_state();
+        insert_run(&state, "run-1", AgentRunStatus::Running);
+
+        let success_event = AgentEvent::Finished {
+            run_id: "run-1".to_string(),
+            timestamp: "2026-10-10T01:00:00Z".to_string(),
+        };
+        assert!(apply_finalize(
+            &state,
+            "run-1",
+            &success_event,
+            "2026-10-10T01:00:00Z",
+            "out".to_string(),
+            1.0,
+            None,
+            true
+        ));
+        // A second finalize (e.g. the blocking prompt thread returning after the
+        // event listener already finalized) must be a no-op.
+        assert!(!apply_finalize(
+            &state,
+            "run-1",
+            &success_event,
+            "2026-10-10T01:00:00Z",
+            "second".to_string(),
+            2.0,
+            None,
+            true
+        ));
+
+        let agents = state.agents.lock().unwrap();
+        let runtime = &agents["run-1"];
+        assert_eq!(
+            runtime.output, "out",
+            "late finalize must not overwrite the run"
+        );
+        assert_eq!(runtime.cost, 1.0);
+        assert_eq!(
+            runtime
+                .events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Finished { .. }))
+                .count(),
+            1,
+            "exactly one Finished event"
+        );
+    }
+
+    #[test]
+    fn async_completion_failure_wins_over_late_success() {
+        let (_temp, state) = temp_state();
+        insert_run(&state, "run-1", AgentRunStatus::Running);
+
+        // The event-listener thread aborts a stuck turn first…
+        let failed_event = AgentEvent::Failed {
+            run_id: "run-1".to_string(),
+            error: "no agent activity for 15 minutes; aborting a stuck turn".to_string(),
+            timestamp: "2026-10-10T01:00:00Z".to_string(),
+        };
+        assert!(apply_finalize(
+            &state,
+            "run-1",
+            &failed_event,
+            "2026-10-10T01:00:00Z",
+            String::new(),
+            0.0,
+            None,
+            false
+        ));
+
+        // …then the blocking prompt finally returns success. It must not
+        // override the failure (async completion guard).
+        let success_event = AgentEvent::Finished {
+            run_id: "run-1".to_string(),
+            timestamp: "2026-10-10T01:00:01Z".to_string(),
+        };
+        assert!(!apply_finalize(
+            &state,
+            "run-1",
+            &success_event,
+            "2026-10-10T01:00:01Z",
+            "late output".to_string(),
+            9.0,
+            None,
+            true
+        ));
+
+        let agents = state.agents.lock().unwrap();
+        let runtime = &agents["run-1"];
+        assert_eq!(runtime.run.status, AgentRunStatus::Failed);
+        assert_eq!(runtime.output, "");
+        assert_eq!(runtime.cost, 0.0);
+        assert!(runtime.events.iter().any(
+            |event| matches!(event, AgentEvent::Failed { error, .. } if error.contains("stuck"))
+        ));
+    }
+
+    #[test]
+    fn classifies_every_failure_shape() {
+        let s = |line: &str| line.to_string();
+        let refused = classify_prompt_failure(
+            true,
+            false,
+            false,
+            false,
+            &[s("tcp connect error: Connection refused (os error 10061)")],
+        );
+        assert!(refused.contains("refused"), "{refused}");
+        let reset =
+            classify_prompt_failure(true, false, false, false, &[s("connection reset by peer")]);
+        assert!(reset.contains("reset"), "{reset}");
+        let connect_timeout = classify_prompt_failure(
+            false,
+            true,
+            false,
+            false,
+            &[s("error trying to connect: timed out")],
+        );
+        assert!(connect_timeout.contains("connecting"), "{connect_timeout}");
+        let response_timeout =
+            classify_prompt_failure(false, true, false, false, &[s("operation timed out")]);
+        assert!(
+            response_timeout.contains("timed out waiting"),
+            "{response_timeout}"
+        );
+        let exited = classify_prompt_failure(
+            false,
+            false,
+            false,
+            false,
+            &[s("connection closed before message completed")],
+        );
+        assert!(exited.contains("terminated the connection"), "{exited}");
+        let garbage = classify_prompt_failure(
+            false,
+            false,
+            false,
+            true,
+            &[s("expected value at line 1 column 1")],
+        );
+        assert!(garbage.contains("unparseable"), "{garbage}");
+    }
+
+    #[test]
+    fn prompt_reports_connection_refused_diagnostic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = OpenCodeClient::new(format!("http://{addr}"), "pw".to_string());
+        let error = client.prompt("ses_1", "hi", None, None, None).unwrap_err();
+        assert!(
+            error.contains("connection refused")
+                || error.contains("could not connect")
+                || error.contains("timed out while connecting"),
+            "got: {error}"
+        );
+        assert!(error.starts_with("prompt failed:"), "got: {error}");
+    }
+
+    #[test]
+    fn prompt_diagnoses_unexpected_process_exit() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // Read the request, start a response claiming 100 bytes, then vanish
+            // without delivering them — like a crashed/killed server process.
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
+            let _ = stream.flush();
+        });
+        let client = OpenCodeClient::new(format!("http://{addr}"), "pw".to_string());
+        let error = client.prompt("ses_1", "hi", None, None, None).unwrap_err();
+        let _ = server.join();
+        assert!(error.starts_with("prompt failed:"), "got: {error}");
+        assert!(
+            error.contains("terminated the connection")
+                || error.contains("unreadable")
+                || error.contains("closed before message completed")
+                || error.contains("reset")
+                || error.contains("forcibly closed")
+                || error.contains("eof"),
+            "no termination diagnostic in: {error}"
+        );
+    }
+
+    #[test]
+    fn prompt_reports_http_error_status_with_redacted_body() {
+        let server = MockServer::start(|request, _body| match request {
+            "POST /session/ses_1/message" => (
+                401,
+                r#"{"error":"unauthorized","accessToken":"super-secret-token-123"}"#.to_string(),
+            ),
+            _ => (404, "{}".to_string()),
+        });
+        let client = OpenCodeClient::new(server.base_url(), "pw".to_string());
+        let error = client.prompt("ses_1", "hi", None, None, None).unwrap_err();
+        assert!(error.contains("401 Unauthorized"), "got: {error}");
+        assert!(error.contains("unauthorized"), "got: {error}");
+        assert!(
+            !error.contains("super-secret-token-123"),
+            "credential leaked: {error}"
+        );
+        assert!(error.contains("<redacted>"), "expected masking in: {error}");
+    }
+
+    #[test]
+    fn http_error_body_read_is_bounded() {
+        let large_body = "x".repeat(64 * 1024);
+        let body = large_body.clone();
+        let server = MockServer::start(move |request, _| match request {
+            "POST /session/ses_1/message" => (500, body.clone()),
+            _ => (404, "{}".to_string()),
+        });
+        let client = OpenCodeClient::new(server.base_url(), "pw".to_string());
+        let error = client.prompt("ses_1", "hi", None, None, None).unwrap_err();
+        assert!(
+            error.len() < 3000,
+            "error body was not bounded ({} bytes): {}",
+            error.len(),
+            &error[..error.len().min(200)]
+        );
+        assert!(error.contains("500 Internal Server Error"));
+    }
+
+    #[test]
+    #[ignore = "slow: holds a connection 31s, past reqwest's 30s default; run with --ignored"]
+    fn prompt_succeeds_when_server_takes_longer_than_default_timeout() {
+        // Regression test for the root cause: reqwest's blocking builder
+        // defaults to a 30s total request timeout, which killed planning and
+        // implementation prompts at ~30s. With `.timeout(None)` the same
+        // request completes at ~31s.
+        let server = MockServer::start(|_request, _body| {
+            std::thread::sleep(Duration::from_secs(31));
+            (
+                200,
+                r#"{"parts":[{"type":"text","text":"finished"}]}"#.to_string(),
+            )
+        });
+        let client = OpenCodeClient::new(server.base_url(), "pw".to_string());
+        let value = client
+            .prompt("ses_1", "do the long work", None, None, None)
+            .expect("31s prompt must not be cut off by a 30s default");
+        assert_eq!(extract_text(&value), "finished");
+    }
+
+    #[test]
+    fn cannot_double_start_an_active_implementation() {
+        // `start_implementation_inner` guards on this exact transition: a task
+        // already Implementing (a run is in flight) can never transition back
+        // to WorkspaceCreating, so no second agent run can be spawned for it.
+        assert!(!crate::domain::TaskStatus::Implementing
+            .can_transition_to(crate::domain::TaskStatus::WorkspaceCreating));
+        assert!(crate::domain::TaskStatus::Approved
+            .can_transition_to(crate::domain::TaskStatus::WorkspaceCreating));
     }
 }

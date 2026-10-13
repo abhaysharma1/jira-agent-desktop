@@ -50,6 +50,44 @@ pub fn adf_to_text(node: &Value) -> String {
     }
 }
 
+/// Maps a JIRA issue payload (`{"id", "key", "fields": {...}}`) to a
+/// [`JiraIssue`]. Shared by the single-issue fetch and the search endpoint.
+fn issue_from_json(value: &Value, key: &str, site_url: Option<&str>) -> JiraIssue {
+    let fields = value.get("fields").cloned().unwrap_or(Value::Null);
+    JiraIssue {
+        key: key.to_string(),
+        id: value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        summary: fields
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        description: fields
+            .get("description")
+            .map(adf_to_text)
+            .unwrap_or_default(),
+        status: fields
+            .get("status")
+            .and_then(|status| status.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        issue_type: fields
+            .get("issuetype")
+            .and_then(|issue_type| issue_type.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        url: site_url
+            .map(|base| format!("{}/browse/{key}", base.trim_end_matches('/')))
+            .unwrap_or_default(),
+    }
+}
+
 pub struct JiraClient {
     api_base: String,
     token: String,
@@ -60,7 +98,7 @@ pub struct JiraClient {
 impl JiraClient {
     pub fn new(api_base: String, token: String) -> Result<Self, String> {
         let http = reqwest::blocking::Client::builder()
-            .user_agent("jira-agent-desktop")
+            .user_agent("ticketbridge-desktop")
             .build()
             .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -122,41 +160,44 @@ impl JiraClient {
             ));
         }
         let value: Value = response.json().map_err(|error| error.to_string())?;
-        let fields = value.get("fields").cloned().unwrap_or(Value::Null);
-        Ok(JiraIssue {
-            key: key.to_string(),
-            id: value
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            summary: fields
-                .get("summary")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            description: fields
-                .get("description")
-                .map(adf_to_text)
-                .unwrap_or_default(),
-            status: fields
-                .get("status")
-                .and_then(|status| status.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            issue_type: fields
-                .get("issuetype")
-                .and_then(|issue_type| issue_type.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            url: self
-                .site_url
-                .as_ref()
-                .map(|base| format!("{}/browse/{key}", base.trim_end_matches('/')))
-                .unwrap_or_default(),
-        })
+        Ok(issue_from_json(&value, key, self.site_url.as_deref()))
+    }
+
+    /// Searches JIRA with JQL, returning at most `limit` issues ordered as the
+    /// query dictates. Uses the new `/search/jql` endpoint (the classic
+    /// `/search` endpoint is deprecated).
+    pub fn search_issues(&self, jql: &str, limit: u32) -> Result<Vec<JiraIssue>, String> {
+        let limit = limit.clamp(1, 50);
+        let response = self
+            .get("/rest/api/3/search/jql")
+            .query(&[
+                ("jql", jql.to_string()),
+                ("maxResults", limit.to_string()),
+                ("fields", "summary,description,status,issuetype".to_string()),
+            ])
+            .send()
+            .map_err(|error| format!("jira request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "jira search failed: {} {}",
+                response.status(),
+                response.text().unwrap_or_default()
+            ));
+        }
+        let value: Value = response.json().map_err(|error| error.to_string())?;
+        Ok(value
+            .get("issues")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let key = item.get("key").and_then(Value::as_str)?;
+                        Some(issue_from_json(item, key, self.site_url.as_deref()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     pub fn transitions(&self, key: &str) -> Result<Vec<JiraTransition>, String> {
@@ -350,7 +391,8 @@ mod tests {
 
     #[test]
     fn calls_jira_through_the_cloud_proxy() {
-        let server = MockServer::start(|request, body| match request {
+        let server = MockServer::start(|request, body| {
+            match request {
             "GET /ex/jira/cloud-1/rest/api/3/myself" => {
                 (200, r#"{"displayName":"Ada Lovelace"}"#.to_string())
             }
@@ -365,6 +407,7 @@ mod tests {
                 (200, r#"{"webhooks":[{"id":10000}]}"#.to_string())
             }
             _ => (404, r#"{"error":"unexpected"}"#.to_string()),
+        }
         });
         let base = format!("{}/ex/jira/cloud-1", server.base_url());
         let client = JiraClient::new(base, "access-1".to_string()).unwrap();
@@ -383,5 +426,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ids, vec![10000]);
+    }
+
+    #[test]
+    fn searches_issues_through_the_cloud_proxy() {
+        let server = MockServer::start(|request, _body| {
+            if request.starts_with("GET /ex/jira/cloud-1/rest/api/3/search/jql?") {
+                (
+                    200,
+                    r#"{"issues":[
+                        {"key":"CC-1","id":"10001","fields":{"summary":"Pagination","status":{"name":"To Do"},"issuetype":{"name":"Task"},"description":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"Add limit"}]}]}}},
+                        {"key":"CC-2","id":"10002","fields":{"summary":"Sorting"}}
+                    ]}"#
+                    .to_string(),
+                )
+            } else {
+                (404, r#"{"error":"unexpected"}"#.to_string())
+            }
+        });
+        let base = format!("{}/ex/jira/cloud-1", server.base_url());
+        let client = JiraClient::new(base, "access-1".to_string())
+            .unwrap()
+            .with_site_url("https://acme.atlassian.net");
+
+        let issues = client
+            .search_issues("assignee = currentUser()", 20)
+            .unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].key, "CC-1");
+        assert_eq!(issues[0].summary, "Pagination");
+        assert_eq!(issues[0].status, "To Do");
+        assert!(issues[0].description.contains("Add limit"));
+        assert_eq!(issues[0].url, "https://acme.atlassian.net/browse/CC-1");
+        assert_eq!(issues[1].key, "CC-2");
     }
 }

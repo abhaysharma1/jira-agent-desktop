@@ -9,8 +9,8 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// The status a resume puts the task into before re-entering its stage, chosen
-/// so the stage's own entry guard accepts it.
+/// The status a resume/retry puts the task into before re-entering its stage,
+/// chosen so the stage's own entry guard accepts it.
 fn entry_status(interrupted_from: &str) -> Result<TaskStatus, String> {
     match interrupted_from {
         "PLANNING" => Ok(TaskStatus::Planning),
@@ -22,17 +22,17 @@ fn entry_status(interrupted_from: &str) -> Result<TaskStatus, String> {
     }
 }
 
-/// Restarts the pipeline stage a task was interrupted in. Only meaningful for
-/// tasks marked `INTERRUPTED` by crash recovery.
+/// Restarts the pipeline stage a task was interrupted or failed in. Used by the
+/// UI's Resume (crash recovery, `INTERRUPTED`) and Retry (`FAILED`) actions.
 #[tauri::command]
 pub fn resume_task(app: AppHandle, state: State<AppState>, task_id: String) -> Result<(), String> {
     let task = {
         let connection = state.db.lock().map_err(|error| error.to_string())?;
         let task = db::get_task(&connection, &task_id)?
             .ok_or_else(|| format!("task not found: {task_id}"))?;
-        if task.status != TaskStatus::Interrupted {
+        if task.status != TaskStatus::Interrupted && task.status != TaskStatus::Failed {
             return Err(format!(
-                "task {task_id} is not interrupted (status {:?})",
+                "task {task_id} is not interrupted or failed (status {:?})",
                 task.status
             ));
         }
@@ -77,7 +77,10 @@ mod tests {
     fn maps_interrupted_stages_to_entry_statuses() {
         assert_eq!(entry_status("PLANNING").unwrap(), TaskStatus::Planning);
         assert_eq!(entry_status("APPROVED").unwrap(), TaskStatus::Approved);
-        assert_eq!(entry_status("WORKSPACE_CREATING").unwrap(), TaskStatus::Approved);
+        assert_eq!(
+            entry_status("WORKSPACE_CREATING").unwrap(),
+            TaskStatus::Approved
+        );
         assert_eq!(entry_status("IMPLEMENTING").unwrap(), TaskStatus::Approved);
         assert_eq!(entry_status("TESTING").unwrap(), TaskStatus::Testing);
         assert_eq!(entry_status("REPAIRING").unwrap(), TaskStatus::Testing);

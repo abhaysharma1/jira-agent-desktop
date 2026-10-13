@@ -35,7 +35,7 @@ pub struct GithubClient {
 impl GithubClient {
     pub fn new(token: String) -> Result<Self, String> {
         let http = reqwest::blocking::Client::builder()
-            .user_agent("jira-agent-desktop")
+            .user_agent("ticketbridge-desktop")
             .build()
             .map_err(|error| error.to_string())?;
         Ok(Self { token, http })
@@ -52,9 +52,7 @@ impl GithubClient {
         if !response.status().is_success() {
             return Err(format!("github auth failed: {}", response.status()));
         }
-        let value: Value = response
-            .json()
-            .map_err(|error| error.to_string())?;
+        let value: Value = response.json().map_err(|error| error.to_string())?;
         value
             .get("login")
             .and_then(Value::as_str)
@@ -73,9 +71,7 @@ impl GithubClient {
     ) -> Result<Value, String> {
         let response = self
             .http
-            .post(format!(
-                "https://api.github.com/repos/{owner}/{repo}/pulls"
-            ))
+            .post(format!("https://api.github.com/repos/{owner}/{repo}/pulls"))
             .bearer_auth(&self.token)
             .header("Accept", "application/vnd.github+json")
             .json(&json!({ "title": title, "head": head, "base": base, "body": body }))
